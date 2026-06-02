@@ -142,15 +142,15 @@ class VolumeSurgeHandler(BaseHTTPRequestHandler):
                     time_label = _symbol_entry_time.get(name, "")
                     time_cell_class = "time-cell"
                 rows_html += f"""\
-            <tr class="{row_class}">
-                <td>{i}</td>
-                <td class="symbol-cell">{name}{badge}</td>
-                <td>{price}</td>
-                <td class="vol-change">{vol_chg}</td>
-                <td>{vol}</td>
-                <td>{price_chg}</td>
-                <td class="{time_cell_class}">{time_label}</td>
-            </tr>
+            <div class="grid-row {row_class}">
+                <div class="cell">{i}</div>
+                <div class="cell symbol-cell">{name}{badge}</div>
+                <div class="cell">{price}</div>
+                <div class="cell vol-change">{vol_chg}</div>
+                <div class="cell">{vol}</div>
+                <div class="cell">{price_chg}</div>
+                <div class="cell {time_cell_class}">{time_label}</div>
+            </div>
 """
             timestamp = _latest_timestamp
             total = len(_latest_scan)
@@ -192,49 +192,74 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans
     0%, 100% {{ text-shadow: 0 0 8px rgba(255,165,2,0.4); }}
     50% {{ text-shadow: 0 0 20px rgba(255,165,2,0.8); }}
 }}
-table {{ width: 100%; border-collapse: collapse; background: #111b26;
-        border-radius: 12px; overflow: hidden; border: 1px solid #2a3a50; }}
-th {{ background: #1a2332; padding: 12px 16px; text-align: left;
-     font-size: 13px; font-weight: 600; color: #7a8da0; text-transform: uppercase;
-     letter-spacing: 0.5px; border-bottom: 1px solid #2a3a50; }}
-td {{ padding: 12px 16px; border-bottom: 1px solid #1c2a3a; font-size: 14px; }}
-tr:last-child td {{ border-bottom: none; }}
-tr:hover {{ background: #1a2635; }}
+/* ===== CSS Grid 表格 ===== */
+.grid-table {{
+    display: grid;
+    grid-template-columns: 40px 2fr 1fr 1.2fr 1.5fr 1fr 1.5fr;
+    background: #111b26;
+    border-radius: 12px;
+    overflow: hidden;
+    border: 1px solid #2a3a50;
+}}
+.grid-header {{
+    display: contents;
+}}
+.grid-header .cell {{
+    background: #1a2332;
+    padding: 12px 16px;
+    font-size: 11px;
+    font-weight: 700;
+    color: #7a8da0;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    border-bottom: 1px solid #2a3a50;
+}}
+.grid-row {{
+    display: contents;
+}}
+.grid-row .cell {{
+    padding: 12px 16px;
+    font-size: 14px;
+    border-bottom: 1px solid #1c2a3a;
+    align-content: center;
+}}
+.grid-row:last-child .cell {{
+    border-bottom: none;
+}}
+.grid-row .cell:hover {{
+    background: #1a2635;
+}}
 
-/* ===== 🆕 新增行 ===== */
-tr.row-new {{
-    background: linear-gradient(135deg, rgba(255, 107, 107, 0.12) 0%, rgba(255, 107, 107, 0.03) 100%);
+/* ===== 🆕 新增行（伪元素发光条用 cell->first-child 实现） ===== */
+.grid-row.row-new .cell:first-child {{
+    position: relative;
+    padding-left: 20px;
 }}
-tr.row-new:hover {{
-    background: linear-gradient(135deg, rgba(255, 107, 107, 0.22) 0%, rgba(255, 107, 107, 0.06) 100%);
-}}
-tr.row-new td:first-child {{
-    padding-left: 20px; position: relative;
-}}
-tr.row-new td:first-child::before {{
+.grid-row.row-new .cell:first-child::before {{
     content: '';
     position: absolute; left: 0; top: 4px; bottom: 4px; width: 4px;
     background: linear-gradient(180deg, #ff6b6b, #ee5a24);
     border-radius: 2px;
     box-shadow: 0 0 10px rgba(255, 107, 107, 0.6);
 }}
+.grid-row.row-new .cell {{
+    background: linear-gradient(135deg, rgba(255, 107, 107, 0.12) 0%, rgba(255, 107, 107, 0.03) 100%);
+}}
 
 /* ===== 🚫 退出行 ===== */
-tr.row-exited {{
-    background: linear-gradient(135deg, rgba(255, 165, 2, 0.10) 0%, rgba(255, 165, 2, 0.02) 100%);
+.grid-row.row-exited .cell:first-child {{
+    position: relative;
+    padding-left: 20px;
 }}
-tr.row-exited:hover {{
-    background: linear-gradient(135deg, rgba(255, 165, 2, 0.18) 0%, rgba(255, 165, 2, 0.05) 100%);
-}}
-tr.row-exited td:first-child {{
-    padding-left: 20px; position: relative;
-}}
-tr.row-exited td:first-child::before {{
+.grid-row.row-exited .cell:first-child::before {{
     content: '';
     position: absolute; left: 0; top: 4px; bottom: 4px; width: 4px;
     background: linear-gradient(180deg, #ffa502, #e67e22);
     border-radius: 2px;
     box-shadow: 0 0 10px rgba(255, 165, 2, 0.5);
+}}
+.grid-row.row-exited .cell {{
+    background: linear-gradient(135deg, rgba(255, 165, 2, 0.10) 0%, rgba(255, 165, 2, 0.02) 100%);
 }}
 
 .symbol-cell {{ font-weight: 600; color: #f0f4f8; }}
@@ -271,7 +296,6 @@ tr.row-exited td:first-child::before {{
 .time-cell {{ font-size: 12px; color: #8a9aaa; white-space: nowrap; }}
 .time-exited {{ color: #ffa502; font-weight: 600; }}
 .footer {{ text-align: center; margin-top: 20px; color: #4a5a6a; font-size: 13px; }}
-.no-data {{ text-align: center; padding: 40px; color: #6a7a8a; font-size: 16px; }}
 </style>
 </head>
 <body>
@@ -301,22 +325,18 @@ tr.row-exited td:first-child::before {{
             </div>
         </div>
     </div>
-    <table>
-        <thead>
-            <tr>
-                <th>#</th>
-                <th>交易对</th>
-                <th>价格</th>
-                <th>24h量变化</th>
-                <th>24h成交量</th>
-                <th>24h价变化</th>
-                <th>进入/退出时间</th>
-            </tr>
-        </thead>
-        <tbody>
-            {rows_html if rows_html else '<tr><td colspan="7" class="no-data">暂无数据，等待首次扫描...</td></tr>'}
-        </tbody>
-    </table>
+    <div class="grid-table">
+        <div class="grid-header">
+            <div class="cell">#</div>
+            <div class="cell">交易对</div>
+            <div class="cell">价格</div>
+            <div class="cell">24h量变化</div>
+            <div class="cell">24h成交量</div>
+            <div class="cell">24h价变化</div>
+            <div class="cell">进入/退出时间</div>
+        </div>
+        {rows_html if rows_html else '<div class="grid-row"><div class="cell" style="grid-column:1/-1;text-align:center;padding:40px;color:#6a7a8a;font-size:16px">暂无数据，等待首次扫描...</div></div>'}
+    </div>
     <div class="footer">
         页面每 60 秒自动刷新 &nbsp;|&nbsp; 条件: 24h成交量变化 &gt; {MIN_VOL_CHANGE_PCT}% &nbsp;|&nbsp;
         更新间隔: {INTERVAL_SECONDS}s &nbsp;|&nbsp; 显示 {displayed}/{total} 条 &nbsp;|&nbsp;
