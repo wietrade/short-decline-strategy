@@ -117,9 +117,7 @@ class VolumeSurgeHandler(BaseHTTPRequestHandler):
                     if r.get("vol_change_24h_pct") != ""
                     else "-"
                 )
-                vol = (
-                    f"{r['vol_24h']:,.0f}" if r.get("vol_24h") != "" else "-"
-                )
+                vol = f"{r['vol_24h']:,.0f}" if r.get("vol_24h") != "" else "-"
                 price_chg = (
                     f"{r['price_change_24h_pct']:.2f}%"
                     if r.get("price_change_24h_pct")
@@ -166,7 +164,7 @@ class VolumeSurgeHandler(BaseHTTPRequestHandler):
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<meta http-equiv="refresh" content="10">
+<meta http-equiv="refresh" content="60">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>币安永续合约 - 成交量异动监控</title>
 <style>
@@ -202,21 +200,73 @@ th {{ background: #1a2332; padding: 12px 16px; text-align: left;
 td {{ padding: 12px 16px; border-bottom: 1px solid #1c2a3a; font-size: 14px; }}
 tr:last-child td {{ border-bottom: none; }}
 tr:hover {{ background: #1a2635; }}
-tr.row-new {{ background: rgba(255, 107, 107, 0.08); }}
-tr.row-new:hover {{ background: rgba(255, 107, 107, 0.15); }}
-tr.row-new td {{ border-left: 3px solid #ff6b6b; }}
-tr.row-exited {{ background: rgba(255, 165, 2, 0.08); }}
-tr.row-exited:hover {{ background: rgba(255, 165, 2, 0.15); }}
-tr.row-exited td {{ border-left: 3px solid #ffa502; }}
+
+/* ===== 🆕 新增行 ===== */
+tr.row-new {{
+    background: linear-gradient(135deg, rgba(255, 107, 107, 0.12) 0%, rgba(255, 107, 107, 0.03) 100%);
+}}
+tr.row-new:hover {{
+    background: linear-gradient(135deg, rgba(255, 107, 107, 0.22) 0%, rgba(255, 107, 107, 0.06) 100%);
+}}
+tr.row-new td:first-child {{
+    padding-left: 20px; position: relative;
+}}
+tr.row-new td:first-child::before {{
+    content: '';
+    position: absolute; left: 0; top: 4px; bottom: 4px; width: 4px;
+    background: linear-gradient(180deg, #ff6b6b, #ee5a24);
+    border-radius: 2px;
+    box-shadow: 0 0 10px rgba(255, 107, 107, 0.6);
+}}
+
+/* ===== 🚫 退出行 ===== */
+tr.row-exited {{
+    background: linear-gradient(135deg, rgba(255, 165, 2, 0.10) 0%, rgba(255, 165, 2, 0.02) 100%);
+}}
+tr.row-exited:hover {{
+    background: linear-gradient(135deg, rgba(255, 165, 2, 0.18) 0%, rgba(255, 165, 2, 0.05) 100%);
+}}
+tr.row-exited td:first-child {{
+    padding-left: 20px; position: relative;
+}}
+tr.row-exited td:first-child::before {{
+    content: '';
+    position: absolute; left: 0; top: 4px; bottom: 4px; width: 4px;
+    background: linear-gradient(180deg, #ffa502, #e67e22);
+    border-radius: 2px;
+    box-shadow: 0 0 10px rgba(255, 165, 2, 0.5);
+}}
+
 .symbol-cell {{ font-weight: 600; color: #f0f4f8; }}
-.badge-new {{ display: inline-block; margin-left: 8px; padding: 2px 8px;
-             background: linear-gradient(135deg, #ff6b6b, #ee5a24);
-             border-radius: 10px; font-size: 11px; font-weight: 700;
-             color: white; animation: pulse-glow 1.5s ease-in-out infinite; }}
-.badge-exited {{ display: inline-block; margin-left: 8px; padding: 2px 8px;
-                background: linear-gradient(135deg, #ffa502, #e67e22);
-                border-radius: 10px; font-size: 11px; font-weight: 700;
-                color: white; animation: pulse-glow-exit 1.5s ease-in-out infinite; }}
+
+/* ===== NEW 徽章 ===== */
+.badge-new {{
+    display: inline-block; margin-left: 8px; padding: 3px 10px;
+    background: linear-gradient(135deg, #ff6b6b, #ee5a24, #ff6b6b);
+    background-size: 200% 100%;
+    border-radius: 12px; font-size: 11px; font-weight: 700;
+    color: white; letter-spacing: 0.5px;
+    box-shadow: 0 0 12px rgba(255, 107, 107, 0.4);
+    animation: badge-shine 2s ease-in-out infinite, pulse-glow 1.5s ease-in-out infinite;
+}}
+
+/* ===== EXIT 徽章 ===== */
+.badge-exited {{
+    display: inline-block; margin-left: 8px; padding: 3px 10px;
+    background: linear-gradient(135deg, #ffa502, #e67e22, #ffa502);
+    background-size: 200% 100%;
+    border-radius: 12px; font-size: 11px; font-weight: 700;
+    color: white; letter-spacing: 0.5px;
+    box-shadow: 0 0 10px rgba(255, 165, 2, 0.3);
+    animation: badge-shine 2.5s ease-in-out infinite, pulse-glow-exit 1.5s ease-in-out infinite;
+}}
+
+@keyframes badge-shine {{
+    0% {{ background-position: 0% 50%; }}
+    50% {{ background-position: 100% 50%; }}
+    100% {{ background-position: 0% 50%; }}
+}}
+
 .vol-change {{ color: #ff6b6b; font-weight: 600; }}
 .time-cell {{ font-size: 12px; color: #8a9aaa; white-space: nowrap; }}
 .time-exited {{ color: #ffa502; font-weight: 600; }}
@@ -268,7 +318,7 @@ tr.row-exited td {{ border-left: 3px solid #ffa502; }}
         </tbody>
     </table>
     <div class="footer">
-        页面每 10 秒自动刷新 &nbsp;|&nbsp; 条件: 24h成交量变化 &gt; {MIN_VOL_CHANGE_PCT}% &nbsp;|&nbsp;
+        页面每 60 秒自动刷新 &nbsp;|&nbsp; 条件: 24h成交量变化 &gt; {MIN_VOL_CHANGE_PCT}% &nbsp;|&nbsp;
         更新间隔: {INTERVAL_SECONDS}s &nbsp;|&nbsp; 显示 {displayed}/{total} 条 &nbsp;|&nbsp;
         🆕 红色行=1小时内新增 &nbsp;|&nbsp; 🚫 橙色行=已退出交易对
     </div>
@@ -620,23 +670,33 @@ def main_loop():
             conn.close()
             for row in exited_rows:
                 name = row["name"]
-                if name not in current_names and name not in {r["name"] for r in all_display}:
-                    all_display.append({
-                        "name": name,
-                        "symbol": row["symbol"],
-                        "price": "",
-                        "type": "",
-                        "exchange": "",
-                        "vol_change_24h_pct": "",
-                        "vol_24h": "",
-                        "price_change_24h_pct": "",
-                        "currency": "",
-                    })
+                if name not in current_names and name not in {
+                    r["name"] for r in all_display
+                }:
+                    all_display.append(
+                        {
+                            "name": name,
+                            "symbol": row["symbol"],
+                            "price": "",
+                            "type": "",
+                            "exchange": "",
+                            "vol_change_24h_pct": "",
+                            "vol_24h": "",
+                            "price_change_24h_pct": "",
+                            "currency": "",
+                        }
+                    )
 
             # 排序：进入的在上（按进入时间降序），退出的在下（按退出时间降序）
             all_display = sort_by_status_and_time(all_display, exited_names_set)
 
-            print_results(all_display, timestamp, len(new_names_set), new_names_set, exited_names_set)
+            print_results(
+                all_display,
+                timestamp,
+                len(new_names_set),
+                new_names_set,
+                exited_names_set,
+            )
             error_count = 0
 
             # 更新 HTTP 全局状态
