@@ -19,3 +19,7 @@ Thumbs.db
 .venv/
 
 test_*.txt
+
+# Êý¾Ý¿â
+*.db
+*.bak

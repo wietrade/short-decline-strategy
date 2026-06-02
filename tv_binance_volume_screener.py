@@ -1,12 +1,12 @@
 """
 TradingView 筛选器：定时获取币安永续合约中 24h 成交量涨跌 > 800% 的交易对
-每分钟更新一次，历史数据追加保存到 CSV 文件。
+每分钟更新一次，历史数据保存在 SQLite 数据库（最多保留 50 条）。
 使用 TradingView Scanner API (非官方)
 """
 
-import csv
 import json
 import os
+import sqlite3
 import time
 import signal
 import sys
@@ -21,9 +21,10 @@ import requests
 MIN_VOL_CHANGE_PCT = 800          # 24h 成交量变化最小百分比
 MAX_RESULTS = 200                 # 最大结果数
 INTERVAL_SECONDS = 60             # 更新间隔（秒），60 = 1分钟
-CSV_FILE = Path(__file__).parent / "data" / "binance_volume_surge_history.csv"
+DB_PATH = Path(__file__).parent / "data" / "volume_surge.db"
 HTTP_PORT = 3000                  # HTTP 服务器端口
 MAX_DISPLAY_RESULTS = 30          # 最多显示记录数
+MAX_HISTORY_RECORDS = 50          # 数据库最多保留记录数
 # ==============================================
 
 # 全局状态
@@ -328,54 +329,118 @@ def get_binance_perpetual_volume_surge(
     return results
 
 
-def load_seen_symbols() -> set[str]:
-    """从已有 CSV 中加载已记录的交易对名称及进入时间。"""
-    global _symbol_entry_time
-    if not CSV_FILE.exists():
-        return set()
-    seen = set()
-    with open(CSV_FILE, "r", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            name = row["name"]
-            seen.add(name)
-            if name not in _symbol_entry_time:
-                _symbol_entry_time[name] = row["first_seen"]
+def get_db() -> sqlite3.Connection:
+    """获取数据库连接（每次调用创建新连接，线程安全）。"""
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+
+def init_db():
+    """初始化数据库表，并迁移旧 CSV 数据（如有）。"""
+    conn = get_db()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS symbols (
+            name        TEXT PRIMARY KEY,
+            entry_time  TEXT NOT NULL,
+            exit_time   TEXT,
+            symbol      TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+
+    # 检查是否有旧 CSV 数据需要迁移
+    count = conn.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
+    if count == 0:
+        csv_file = Path(__file__).parent / "data" / "binance_volume_surge_history.csv"
+        if csv_file.exists():
+            import csv
+            migrated = 0
+            with open(csv_file, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    try:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO symbols (name, entry_time, symbol) VALUES (?, ?, ?)",
+                            (row["name"], row["first_seen"], row["symbol"])
+                        )
+                        migrated += 1
+                    except Exception:
+                        pass
+            conn.commit()
+            # 迁移后清理旧 CSV
+            csv_file.rename(csv_file.with_suffix(".csv.bak"))
+            print(f"  已从 CSV 迁移 {migrated} 条记录到 SQLite")
+    conn.close()
+
+
+def load_from_db():
+    """从数据库加载所有记录到内存缓存。返回 (seen_symbols, entry_time, exit_time)。"""
+    global _seen_symbols, _symbol_entry_time, _symbol_exit_time
+    conn = get_db()
+    rows = conn.execute("SELECT name, entry_time, exit_time FROM symbols ORDER BY entry_time DESC").fetchall()
+    conn.close()
+
+    seen: set[str] = set()
+    entry: dict[str, str] = {}
+    exit_t: dict[str, str] = {}
+
+    for row in rows:
+        name = row["name"]
+        seen.add(name)
+        if name not in entry:
+            entry[name] = row["entry_time"]
+        if row["exit_time"] and name not in exit_t:
+            exit_t[name] = row["exit_time"]
+
+    _seen_symbols = seen
+    _symbol_entry_time = entry
+    _symbol_exit_time = exit_t
+    print(f"  从数据库加载 {len(seen)} 个交易对记录")
     return seen
 
 
-def save_to_csv(new_entries: list[dict], timestamp: str) -> tuple[int, list[str]]:
-    """仅保存首次出现的交易对到 CSV。返回 (新增数量, 新增name列表)。"""
+def save_to_db(new_entries: list[dict], timestamp: str) -> tuple[int, list[str]]:
+    """保存新增交易对到数据库，并清理超出 MAX_HISTORY_RECORDS 的旧数据。
+    返回 (新增数量, 新增name列表)。"""
     global _seen_symbols, _symbol_entry_time
-    CSV_FILE.parent.mkdir(parents=True, exist_ok=True)
-    file_exists = CSV_FILE.exists()
 
-    # 过滤出未出现过的
     fresh = [r for r in new_entries if r["name"] not in _seen_symbols]
     if not fresh:
         return 0, []
 
+    conn = get_db()
     fresh_names = []
-    with open(CSV_FILE, "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        if not file_exists:
-            writer.writerow([
-                "first_seen", "name", "symbol", "price",
-                "vol_change_24h_pct", "vol_24h", "price_change_24h_pct", "currency"
-            ])
-        for r in fresh:
-            writer.writerow([
-                timestamp, r["name"], r["symbol"], r["price"],
-                f"{r['vol_change_24h_pct']:.2f}",
-                f"{r['vol_24h']:.2f}",
-                f"{r['price_change_24h_pct']:.2f}" if r["price_change_24h_pct"] else "",
-                r["currency"],
-            ])
-            _seen_symbols.add(r["name"])
-            _symbol_entry_time[r["name"]] = timestamp
-            fresh_names.append(r["name"])
+    for r in fresh:
+        conn.execute(
+            "INSERT OR IGNORE INTO symbols (name, entry_time, symbol) VALUES (?, ?, ?)",
+            (r["name"], timestamp, r["symbol"])
+        )
+        _seen_symbols.add(r["name"])
+        _symbol_entry_time[r["name"]] = timestamp
+        fresh_names.append(r["name"])
 
+    # 清理：只保留最新的 MAX_HISTORY_RECORDS 条
+    conn.execute(f"""
+        DELETE FROM symbols WHERE name IN (
+            SELECT name FROM symbols ORDER BY entry_time DESC LIMIT -1 OFFSET {MAX_HISTORY_RECORDS}
+        )
+    """)
+    conn.commit()
+    conn.close()
     return len(fresh), fresh_names
+
+
+def update_exit_in_db(name: str, exit_timestamp: str):
+    """更新交易对的退出时间。"""
+    global _symbol_exit_time
+    conn = get_db()
+    conn.execute("UPDATE symbols SET exit_time = ? WHERE name = ?", (exit_timestamp, name))
+    conn.commit()
+    conn.close()
+    _symbol_exit_time[name] = exit_timestamp
 
 
 def print_results(results: list[dict], timestamp: str, new_count: int,
@@ -422,8 +487,9 @@ def main_loop():
     """主循环：定时获取数据并保存。"""
     global _seen_symbols, _latest_scan, _latest_new_symbols, _latest_exited_symbols, _latest_timestamp, _previous_scan_symbols, _symbol_exit_time
 
-    # 启动时加载已有记录
-    _seen_symbols = load_seen_symbols()
+    # 初始化数据库 + 加载已有记录
+    init_db()
+    _seen_symbols = load_from_db()
 
     # 启动 HTTP 服务器
     http_server, _ = start_http_server()
@@ -432,7 +498,8 @@ def main_loop():
     print(f"  间隔: {INTERVAL_SECONDS}s ({INTERVAL_SECONDS//60}分{INTERVAL_SECONDS%60}秒)")
     print(f"  阈值: 24h成交量变化 > {MIN_VOL_CHANGE_PCT}%")
     print(f"  最多显示: {MAX_DISPLAY_RESULTS} 条")
-    print(f"  保存: {CSV_FILE}")
+    print(f"  数据库最多保留: {MAX_HISTORY_RECORDS} 条记录")
+    print(f"  数据库: {DB_PATH}")
     print(f"  历史已记录: {len(_seen_symbols)} 个交易对")
     print(f"  HTTP 显示: http://localhost:{HTTP_PORT}")
     print(f"  按 Ctrl+C 停止\n")
@@ -442,7 +509,7 @@ def main_loop():
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         try:
             results = get_binance_perpetual_volume_surge()
-            new_count, fresh_names = save_to_csv(results, timestamp)
+            new_count, fresh_names = save_to_db(results, timestamp)
             new_names_set = set(fresh_names)
 
             # 检测退出交易对：上一次有但本次没有
@@ -451,7 +518,7 @@ def main_loop():
             if _previous_scan_symbols:
                 exited_names_set = _previous_scan_symbols - current_names
                 for en in exited_names_set:
-                    _symbol_exit_time[en] = timestamp
+                    update_exit_in_db(en, timestamp)
             _previous_scan_symbols = current_names
 
             print_results(results, timestamp, new_count, new_names_set, exited_names_set)
@@ -477,7 +544,7 @@ def main_loop():
 
     # 关闭 HTTP 服务器
     http_server.shutdown()
-    print(f"\n已停止。历史数据保存在: {CSV_FILE}")
+    print(f"\n已停止。历史数据保存在: {DB_PATH}")
 
 
 if __name__ == "__main__":
