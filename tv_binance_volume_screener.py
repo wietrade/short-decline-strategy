@@ -9,7 +9,7 @@ import signal
 import sqlite3
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -111,13 +111,19 @@ class VolumeSurgeHandler(BaseHTTPRequestHandler):
             rows_html = ""
             for i, r in enumerate(display, 1):
                 name = r["name"]
-                price = f"{r['price']}"
-                vol_chg = f"{r['vol_change_24h_pct']:.1f}%"
-                vol = f"{r['vol_24h']:,.0f}"
+                price = f"{r['price']}" if r.get("price") else "-"
+                vol_chg = (
+                    f"{r['vol_change_24h_pct']:.1f}%"
+                    if r.get("vol_change_24h_pct") != ""
+                    else "-"
+                )
+                vol = (
+                    f"{r['vol_24h']:,.0f}" if r.get("vol_24h") != "" else "-"
+                )
                 price_chg = (
                     f"{r['price_change_24h_pct']:.2f}%"
                     if r.get("price_change_24h_pct")
-                    else "N/A"
+                    else "-"
                 )
                 is_new = name in _latest_new_symbols
                 is_exited = name in _latest_exited_symbols
@@ -232,11 +238,11 @@ tr.row-exited td {{ border-left: 3px solid #ffa502; }}
                 <div class="value">{total}</div>
             </div>
             <div class="stat-item">
-                <div class="label">新增 (本轮)</div>
+                <div class="label">1h内新增</div>
                 <div class="value new">{new_count}</div>
             </div>
             <div class="stat-item">
-                <div class="label">退出 (本轮)</div>
+                <div class="label">已退出</div>
                 <div class="value exited">{exited_count}</div>
             </div>
             <div class="stat-item">
@@ -264,7 +270,7 @@ tr.row-exited td {{ border-left: 3px solid #ffa502; }}
     <div class="footer">
         页面每 10 秒自动刷新 &nbsp;|&nbsp; 条件: 24h成交量变化 &gt; {MIN_VOL_CHANGE_PCT}% &nbsp;|&nbsp;
         更新间隔: {INTERVAL_SECONDS}s &nbsp;|&nbsp; 显示 {displayed}/{total} 条 &nbsp;|&nbsp;
-        🆕 红色行=本轮新增 &nbsp;|&nbsp; 🚫 橙色行=本轮退出
+        🆕 红色行=1小时内新增 &nbsp;|&nbsp; 🚫 橙色行=已退出交易对
     </div>
 </div>
 </body>
@@ -503,13 +509,13 @@ def print_results(
     new_names = new_names or set()
     exited_names = exited_names or set()
     display = results[:MAX_DISPLAY_RESULTS]
-    print(f"\n{'=' * 85}")
+    print(f"\n{'=' * 95}")
     print(f"  时间: {timestamp}")
     print(f"  条件: 币安永续合约 24h成交量涨跌 > {MIN_VOL_CHANGE_PCT}%")
     print(
-        f"  当前 {len(results)} 个 | 新增 {new_count} 个 | 退出 {len(exited_names)} 个 | 历史累计 {len(_seen_symbols)} 个"
+        f"  显示 {len(results)} 个 | 1h内新增 {new_count} 个 | 已退出 {len(exited_names)} 个 | 历史累计 {len(_seen_symbols)} 个"
     )
-    print(f"{'=' * 85}")
+    print(f"{'=' * 95}")
 
     if not display:
         print("  (无符合条件的交易对)")
@@ -579,29 +585,63 @@ def main_loop():
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         try:
             results = get_binance_perpetual_volume_surge()
-            new_count, fresh_names = save_to_db(results, timestamp)
-            new_names_set = set(fresh_names)
-
-            # 检测退出交易对：上一次有但本次没有
             current_names = {r["name"] for r in results}
-            exited_names_set = set()
+
+            # 检测本轮退出并写入DB
+            newly_exited = set()
             if _previous_scan_symbols:
-                exited_names_set = _previous_scan_symbols - current_names
-                for en in exited_names_set:
+                newly_exited = _previous_scan_symbols - current_names
+                for en in newly_exited:
                     update_exit_in_db(en, timestamp)
             _previous_scan_symbols = current_names
 
-            # 排序：进入的在上（按进入时间降序），退出的在下（按退出时间降序）
-            results = sort_by_status_and_time(results, exited_names_set)
+            # 保存新增到DB
+            save_to_db(results, timestamp)
 
-            print_results(
-                results, timestamp, new_count, new_names_set, exited_names_set
+            # ---- NEW 标记：1小时内进入的 ----
+            one_hour_ago = (datetime.now() - timedelta(hours=1)).strftime(
+                "%Y-%m-%d %H:%M:%S"
             )
+            new_names_set = {
+                r["name"]
+                for r in results
+                if _symbol_entry_time.get(r["name"], "") >= one_hour_ago
+            }
+
+            # ---- EXIT 标记：DB中所有有退出时间的 ----
+            exited_names_set = set(_symbol_exit_time.keys())
+
+            # ---- 从DB获取已退出交易对，追加到显示列表 ----
+            all_display = list(results)
+            conn = get_db()
+            exited_rows = conn.execute(
+                "SELECT name, symbol, exit_time FROM symbols WHERE exit_time IS NOT NULL ORDER BY exit_time DESC"
+            ).fetchall()
+            conn.close()
+            for row in exited_rows:
+                name = row["name"]
+                if name not in current_names and name not in {r["name"] for r in all_display}:
+                    all_display.append({
+                        "name": name,
+                        "symbol": row["symbol"],
+                        "price": "",
+                        "type": "",
+                        "exchange": "",
+                        "vol_change_24h_pct": "",
+                        "vol_24h": "",
+                        "price_change_24h_pct": "",
+                        "currency": "",
+                    })
+
+            # 排序：进入的在上（按进入时间降序），退出的在下（按退出时间降序）
+            all_display = sort_by_status_and_time(all_display, exited_names_set)
+
+            print_results(all_display, timestamp, len(new_names_set), new_names_set, exited_names_set)
             error_count = 0
 
             # 更新 HTTP 全局状态
             with _scan_lock:
-                _latest_scan = results
+                _latest_scan = all_display
                 _latest_timestamp = timestamp
                 _latest_new_symbols = new_names_set
                 _latest_exited_symbols = exited_names_set
