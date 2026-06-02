@@ -5,31 +5,29 @@ TradingView 筛选器：定时获取币安永续合约中 24h 成交量涨跌 > 
 """
 
 import json
-import os
-import sqlite3
-import time
 import signal
-import sys
+import sqlite3
 import threading
+import time
 from datetime import datetime
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import requests
 
 # ==================== 配置 ====================
-MIN_VOL_CHANGE_PCT = 800          # 24h 成交量变化最小百分比
-MAX_RESULTS = 200                 # 最大结果数
-INTERVAL_SECONDS = 60             # 更新间隔（秒），60 = 1分钟
+MIN_VOL_CHANGE_PCT = 800  # 24h 成交量变化最小百分比
+MAX_RESULTS = 200  # 最大结果数
+INTERVAL_SECONDS = 60  # 更新间隔（秒），60 = 1分钟
 DB_PATH = Path(__file__).parent / "data" / "volume_surge.db"
-HTTP_PORT = 3000                  # HTTP 服务器端口
-MAX_DISPLAY_RESULTS = 30          # 最多显示记录数
-MAX_HISTORY_RECORDS = 50          # 数据库最多保留记录数
+HTTP_PORT = 3000  # HTTP 服务器端口
+MAX_DISPLAY_RESULTS = 30  # 最多显示记录数
+MAX_HISTORY_RECORDS = 50  # 数据库最多保留记录数
 # ==============================================
 
 # 全局状态
 _running = True
-_seen_symbols: set[str] = set()   # 已写入 CSV 的交易对（内存缓存）
+_seen_symbols: set[str] = set()  # 已写入 CSV 的交易对（内存缓存）
 
 
 def signal_handler(sig, frame):
@@ -53,8 +51,8 @@ _scan_lock = threading.Lock()
 _previous_scan_symbols: set[str] = set()
 
 # 交易对进入/退出时间记录
-_symbol_entry_time: dict[str, str] = {}   # name -> 首次进入时间
-_symbol_exit_time: dict[str, str] = {}    # name -> 退出时间
+_symbol_entry_time: dict[str, str] = {}  # name -> 首次进入时间
+_symbol_exit_time: dict[str, str] = {}  # name -> 退出时间
 
 
 class VolumeSurgeHandler(BaseHTTPRequestHandler):
@@ -95,7 +93,9 @@ class VolumeSurgeHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
-        self.wfile.write(json.dumps(data, ensure_ascii=False, default=str).encode("utf-8"))
+        self.wfile.write(
+            json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
+        )
 
     def _serve_html(self):
         html = self._build_html()
@@ -114,7 +114,11 @@ class VolumeSurgeHandler(BaseHTTPRequestHandler):
                 price = f"{r['price']}"
                 vol_chg = f"{r['vol_change_24h_pct']:.1f}%"
                 vol = f"{r['vol_24h']:,.0f}"
-                price_chg = f"{r['price_change_24h_pct']:.2f}%" if r.get("price_change_24h_pct") else "N/A"
+                price_chg = (
+                    f"{r['price_change_24h_pct']:.2f}%"
+                    if r.get("price_change_24h_pct")
+                    else "N/A"
+                )
                 is_new = name in _latest_new_symbols
                 is_exited = name in _latest_exited_symbols
                 if is_new:
@@ -221,7 +225,7 @@ tr.row-exited td {{ border-left: 3px solid #ffa502; }}
         <div class="stats">
             <div class="stat-item">
                 <div class="label">最后更新</div>
-                <div class="value">{timestamp or '等待中...'}</div>
+                <div class="value">{timestamp or "等待中..."}</div>
             </div>
             <div class="stat-item">
                 <div class="label">当前结果</div>
@@ -274,7 +278,9 @@ tr.row-exited td {{ border-left: 3px solid #ffa502; }}
 def start_http_server():
     """在后台线程启动 HTTP 服务器。"""
     server = HTTPServer(("0.0.0.0", HTTP_PORT), VolumeSurgeHandler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True, name="HttpServer")
+    thread = threading.Thread(
+        target=server.serve_forever, daemon=True, name="HttpServer"
+    )
     thread.start()
     return server, thread
 
@@ -290,16 +296,40 @@ def get_binance_perpetual_volume_surge(
     payload = {
         "symbols": {},
         "columns": [
-            "name", "close", "type", "exchange",
-            "24h_vol_change|5", "24h_vol|5", "24h_close_change|5", "currency",
+            "name",
+            "close",
+            "type",
+            "exchange",
+            "24h_vol_change|5",
+            "24h_vol|5",
+            "24h_close_change|5",
+            "currency",
         ],
         "filter2": {
             "operator": "and",
             "operands": [
-                {"expression": {"left": "centralization", "operation": "equal", "right": "cex"}},
+                {
+                    "expression": {
+                        "left": "centralization",
+                        "operation": "equal",
+                        "right": "cex",
+                    }
+                },
                 {"expression": {"left": "type", "operation": "equal", "right": "swap"}},
-                {"expression": {"left": "exchange", "operation": "equal", "right": "BINANCE"}},
-                {"expression": {"left": "24h_vol_change|5", "operation": "greater", "right": min_vol_change_pct}},
+                {
+                    "expression": {
+                        "left": "exchange",
+                        "operation": "equal",
+                        "right": "BINANCE",
+                    }
+                },
+                {
+                    "expression": {
+                        "left": "24h_vol_change|5",
+                        "operation": "greater",
+                        "right": min_vol_change_pct,
+                    }
+                },
             ],
         },
         "sort": {"sortBy": sort_by, "sortOrder": "desc"},
@@ -315,17 +345,19 @@ def get_binance_perpetual_volume_surge(
     results = []
     for item in data.get("data", []):
         d = item["d"]
-        results.append({
-            "symbol": item["s"],
-            "name": d[0],
-            "price": d[1],
-            "type": d[2],
-            "exchange": d[3],
-            "vol_change_24h_pct": d[4],
-            "vol_24h": d[5],
-            "price_change_24h_pct": d[6] if len(d) > 6 else None,
-            "currency": d[7] if len(d) > 7 else None,
-        })
+        results.append(
+            {
+                "symbol": item["s"],
+                "name": d[0],
+                "price": d[1],
+                "type": d[2],
+                "exchange": d[3],
+                "vol_change_24h_pct": d[4],
+                "vol_24h": d[5],
+                "price_change_24h_pct": d[6] if len(d) > 6 else None,
+                "currency": d[7] if len(d) > 7 else None,
+            }
+        )
     return results
 
 
@@ -357,6 +389,7 @@ def init_db():
         csv_file = Path(__file__).parent / "data" / "binance_volume_surge_history.csv"
         if csv_file.exists():
             import csv
+
             migrated = 0
             with open(csv_file, "r", encoding="utf-8") as f:
                 reader = csv.DictReader(f)
@@ -364,7 +397,7 @@ def init_db():
                     try:
                         conn.execute(
                             "INSERT OR IGNORE INTO symbols (name, entry_time, symbol) VALUES (?, ?, ?)",
-                            (row["name"], row["first_seen"], row["symbol"])
+                            (row["name"], row["first_seen"], row["symbol"]),
                         )
                         migrated += 1
                     except Exception:
@@ -380,7 +413,9 @@ def load_from_db():
     """从数据库加载所有记录到内存缓存。返回 (seen_symbols, entry_time, exit_time)。"""
     global _seen_symbols, _symbol_entry_time, _symbol_exit_time
     conn = get_db()
-    rows = conn.execute("SELECT name, entry_time, exit_time FROM symbols ORDER BY entry_time DESC").fetchall()
+    rows = conn.execute(
+        "SELECT name, entry_time, exit_time FROM symbols ORDER BY entry_time DESC"
+    ).fetchall()
     conn.close()
 
     seen: set[str] = set()
@@ -416,7 +451,7 @@ def save_to_db(new_entries: list[dict], timestamp: str) -> tuple[int, list[str]]
     for r in fresh:
         conn.execute(
             "INSERT OR IGNORE INTO symbols (name, entry_time, symbol) VALUES (?, ?, ?)",
-            (r["name"], timestamp, r["symbol"])
+            (r["name"], timestamp, r["symbol"]),
         )
         _seen_symbols.add(r["name"])
         _symbol_entry_time[r["name"]] = timestamp
@@ -433,41 +468,65 @@ def save_to_db(new_entries: list[dict], timestamp: str) -> tuple[int, list[str]]
     return len(fresh), fresh_names
 
 
+def sort_by_status_and_time(
+    results: list[dict],
+    exited_names: set[str],
+) -> list[dict]:
+    """排序：进入的在上（按进入时间降序），退出的在下（按退出时间降序）。"""
+    active = [r for r in results if r["name"] not in exited_names]
+    exited = [r for r in results if r["name"] in exited_names]
+    active.sort(key=lambda r: _symbol_entry_time.get(r["name"], ""), reverse=True)
+    exited.sort(key=lambda r: _symbol_exit_time.get(r["name"], ""), reverse=True)
+    return active + exited
+
+
 def update_exit_in_db(name: str, exit_timestamp: str):
     """更新交易对的退出时间。"""
     global _symbol_exit_time
     conn = get_db()
-    conn.execute("UPDATE symbols SET exit_time = ? WHERE name = ?", (exit_timestamp, name))
+    conn.execute(
+        "UPDATE symbols SET exit_time = ? WHERE name = ?", (exit_timestamp, name)
+    )
     conn.commit()
     conn.close()
     _symbol_exit_time[name] = exit_timestamp
 
 
-def print_results(results: list[dict], timestamp: str, new_count: int,
-                  new_names: set[str] | None = None,
-                  exited_names: set[str] | None = None) -> None:
+def print_results(
+    results: list[dict],
+    timestamp: str,
+    new_count: int,
+    new_names: set[str] | None = None,
+    exited_names: set[str] | None = None,
+) -> None:
     """格式化打印结果（最多显示 MAX_DISPLAY_RESULTS 条）。"""
     new_names = new_names or set()
     exited_names = exited_names or set()
     display = results[:MAX_DISPLAY_RESULTS]
-    print(f"\n{'='*85}")
+    print(f"\n{'=' * 85}")
     print(f"  时间: {timestamp}")
     print(f"  条件: 币安永续合约 24h成交量涨跌 > {MIN_VOL_CHANGE_PCT}%")
-    print(f"  当前 {len(results)} 个 | 新增 {new_count} 个 | 退出 {len(exited_names)} 个 | 历史累计 {len(_seen_symbols)} 个")
-    print(f"{'='*85}")
+    print(
+        f"  当前 {len(results)} 个 | 新增 {new_count} 个 | 退出 {len(exited_names)} 个 | 历史累计 {len(_seen_symbols)} 个"
+    )
+    print(f"{'=' * 85}")
 
     if not display:
         print("  (无符合条件的交易对)")
         return
 
-    print(f"{'排名':<4} {'交易对':<22} {'价格':>10} {'24h量变化':>12} {'24h成交量':>18} {'24h价变化':>10} {'时间':<20} {'标记':<8}")
+    print(
+        f"{'排名':<4} {'交易对':<22} {'价格':>10} {'24h量变化':>12} {'24h成交量':>18} {'24h价变化':>10} {'时间':<20} {'标记':<8}"
+    )
     print("-" * 114)
     for i, r in enumerate(display, 1):
         name = r["name"]
         price = f"{r['price']}"
         vol_chg = f"{r['vol_change_24h_pct']:.1f}%"
         vol = f"{r['vol_24h']:,.0f}"
-        price_chg = f"{r['price_change_24h_pct']:.2f}%" if r["price_change_24h_pct"] else "N/A"
+        price_chg = (
+            f"{r['price_change_24h_pct']:.2f}%" if r["price_change_24h_pct"] else "N/A"
+        )
         if name in new_names:
             tag = "🆕 NEW"
         elif name in exited_names:
@@ -478,14 +537,23 @@ def print_results(results: list[dict], timestamp: str, new_count: int,
         t = _symbol_entry_time.get(name, "")
         if name in exited_names:
             t = _symbol_exit_time.get(name, t)
-        print(f"{i:<4} {name:<22} {price:>10} {vol_chg:>12} {vol:>18} {price_chg:>10} {t:<20} {tag:<8}")
+        print(
+            f"{i:<4} {name:<22} {price:>10} {vol_chg:>12} {vol:>18} {price_chg:>10} {t:<20} {tag:<8}"
+        )
     if len(results) > MAX_DISPLAY_RESULTS:
         print(f"  ... 还有 {len(results) - MAX_DISPLAY_RESULTS} 个未显示")
 
 
 def main_loop():
     """主循环：定时获取数据并保存。"""
-    global _seen_symbols, _latest_scan, _latest_new_symbols, _latest_exited_symbols, _latest_timestamp, _previous_scan_symbols, _symbol_exit_time
+    global \
+        _seen_symbols, \
+        _latest_scan, \
+        _latest_new_symbols, \
+        _latest_exited_symbols, \
+        _latest_timestamp, \
+        _previous_scan_symbols, \
+        _symbol_exit_time
 
     # 初始化数据库 + 加载已有记录
     init_db()
@@ -494,15 +562,17 @@ def main_loop():
     # 启动 HTTP 服务器
     http_server, _ = start_http_server()
 
-    print(f"启动定时监控...")
-    print(f"  间隔: {INTERVAL_SECONDS}s ({INTERVAL_SECONDS//60}分{INTERVAL_SECONDS%60}秒)")
+    print("启动定时监控...")
+    print(
+        f"  间隔: {INTERVAL_SECONDS}s ({INTERVAL_SECONDS // 60}分{INTERVAL_SECONDS % 60}秒)"
+    )
     print(f"  阈值: 24h成交量变化 > {MIN_VOL_CHANGE_PCT}%")
     print(f"  最多显示: {MAX_DISPLAY_RESULTS} 条")
     print(f"  数据库最多保留: {MAX_HISTORY_RECORDS} 条记录")
     print(f"  数据库: {DB_PATH}")
     print(f"  历史已记录: {len(_seen_symbols)} 个交易对")
     print(f"  HTTP 显示: http://localhost:{HTTP_PORT}")
-    print(f"  按 Ctrl+C 停止\n")
+    print("  按 Ctrl+C 停止\n")
 
     error_count = 0
     while _running:
@@ -521,7 +591,12 @@ def main_loop():
                     update_exit_in_db(en, timestamp)
             _previous_scan_symbols = current_names
 
-            print_results(results, timestamp, new_count, new_names_set, exited_names_set)
+            # 排序：进入的在上（按进入时间降序），退出的在下（按退出时间降序）
+            results = sort_by_status_and_time(results, exited_names_set)
+
+            print_results(
+                results, timestamp, new_count, new_names_set, exited_names_set
+            )
             error_count = 0
 
             # 更新 HTTP 全局状态
