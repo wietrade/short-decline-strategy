@@ -20,7 +20,7 @@ MIN_VOL_CHANGE_PCT = 800  # 24h 成交量变化最小百分比
 MAX_RESULTS = 200  # 最大结果数
 INTERVAL_SECONDS = 60  # 更新间隔（秒），60 = 1分钟
 DB_PATH = Path(__file__).parent / "data" / "volume_surge.db"
-HTTP_PORT = 3000  # HTTP 服务器端口
+HTTP_PORT = 3001  # HTTP 服务器端口
 MAX_DISPLAY_RESULTS = 30  # 最多显示记录数
 MAX_HISTORY_RECORDS = 50  # 数据库最多保留记录数
 # ==============================================
@@ -59,10 +59,29 @@ class VolumeSurgeHandler(BaseHTTPRequestHandler):
     """HTTP 请求处理器：显示最新的扫描结果。"""
 
     def do_GET(self):
-        if self.path == "/api/data":
+        # 解析查询参数
+        parsed = self.path.split("?", 1)
+        path = parsed[0]
+        params = {}
+        if len(parsed) > 1:
+            for kv in parsed[1].split("&"):
+                if "=" in kv:
+                    k, v = kv.split("=", 1)
+                    params[k] = v
+                else:
+                    params[kv] = ""
+
+        if path == "/api/data":
             self._serve_json()
-        elif self.path == "/" or self.path == "/index.html":
-            self._serve_html()
+        elif path == "/api/list":
+            self._serve_json_list(params)
+        elif path == "/api/pairlist":
+            self._serve_pairlist()
+        elif path == "/" or path == "/index.html":
+            if params.get("format") == "json":
+                self._serve_json()
+            else:
+                self._serve_html()
         else:
             self.send_response(404)
             self.end_headers()
@@ -71,7 +90,6 @@ class VolumeSurgeHandler(BaseHTTPRequestHandler):
     def _serve_json(self):
         with _scan_lock:
             display = _latest_scan[:MAX_DISPLAY_RESULTS]
-            # 为每个结果附加时间信息
             enriched = []
             for r in display:
                 item = dict(r)
@@ -89,260 +107,365 @@ class VolumeSurgeHandler(BaseHTTPRequestHandler):
                 "latest_new_symbols": list(_latest_new_symbols),
                 "latest_exited_symbols": list(_latest_exited_symbols),
             }
+        body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
-        self.wfile.write(
-            json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
-        )
+        self.wfile.write(body)
+
+    @staticmethod
+    def _to_freqtrade_pair(name: str) -> str:
+        """将 TradingView 格式的交易对转为 freqtrade 格式，如 RIFUSDT.P -> RIF/USDT"""
+        # 去掉 .P / .PERP 后缀
+        for suffix in (".P", ".PERP"):
+            if name.endswith(suffix):
+                name = name[: -len(suffix)]
+                break
+        # 在稳定币前加 / 分隔
+        for quote in ("USDT", "USDC", "BUSD", "DAI", "FDUSD"):
+            if name.endswith(quote) and len(name) > len(quote):
+                base = name[: -len(quote)]
+                return f"{base}/{quote}"
+        return name
+
+    def _serve_json_list(self, params):
+        """返回精简的最新列表 JSON，支持参数:
+        type: all(默认), new, exited
+        format: pair(仅返回交易对列表，freqtrade 格式)
+        """
+        list_type = params.get("type", "all")
+        fmt = params.get("format", "full")
+        with _scan_lock:
+            if list_type == "new":
+                items = [r for r in _latest_scan if r["name"] in _latest_new_symbols]
+            elif list_type == "exited":
+                items = [r for r in _latest_scan if r["name"] in _latest_exited_symbols]
+            else:
+                items = _latest_scan[:]
+
+            if fmt == "pair":
+                # 仅返回 freqtrade 格式的交易对列表
+                pairs = [self._to_freqtrade_pair(r["name"]) for r in items]
+                body = json.dumps(pairs, ensure_ascii=False).encode("utf-8")
+            else:
+                result = []
+                for r in items:
+                    result.append(
+                        {
+                            "name": r["name"],
+                            "price": r.get("price"),
+                            "vol_change_24h_pct": r.get("vol_change_24h_pct"),
+                            "vol_24h": r.get("vol_24h"),
+                            "price_change_24h_pct": r.get("price_change_24h_pct"),
+                            "entry_time": _symbol_entry_time.get(r["name"], ""),
+                            "exit_time": _symbol_exit_time.get(r["name"], ""),
+                        }
+                    )
+
+                data = {
+                    "timestamp": _latest_timestamp,
+                    "type": list_type,
+                    "total": len(items),
+                    "results": result,
+                }
+                body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_pairlist(self):
+        """为 Freqtrade RemotePairList 插件提供交易对列表（仅30分钟内新增的）"""
+        pairs = self._to_freqtrade_pair_list(minutes=30)
+        data = {"pairs": pairs, "refresh_period": 1800}
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    @staticmethod
+    def _to_freqtrade_pair_list(minutes: int = 0) -> list:
+        """将当前异动列表转为 Freqtrade 永续合约格式。
+        如果 minutes>0，仅返回最近 minutes 分钟内进入列表的交易对。
+        """
+        cut = ""
+        if minutes > 0:
+            cut = (datetime.now() - timedelta(minutes=minutes)).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+        with _scan_lock:
+            result = []
+            for r in _latest_scan:
+                name = r.get("name", "")
+                # 过滤: 只保留指定时间内进入的
+                if cut:
+                    entry = _symbol_entry_time.get(name, "")
+                    if not entry or entry < cut:
+                        continue
+                # RIFUSDT.P -> RIF/USDT:USDT
+                for suffix in (".P", ".PERP"):
+                    if name.endswith(suffix):
+                        name = name[: -len(suffix)]
+                        break
+                for quote in ("USDT", "USDC", "BUSD", "FDUSD"):
+                    if name.endswith(quote) and len(name) > len(quote):
+                        base = name[: -len(quote)]
+                        result.append(f"{base}/{quote}:{quote}")
+                        break
+            return result
 
     def _serve_html(self):
-        html = self._build_html()
+        body = self._build_html().encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(html.encode("utf-8"))
+        self.wfile.write(body)
 
     def _build_html(self) -> str:
-        """构建美观的 HTML 页面。"""
-        with _scan_lock:
-            display = _latest_scan[:MAX_DISPLAY_RESULTS]
-            rows_html = ""
-            for i, r in enumerate(display, 1):
-                name = r["name"]
-                price = f"{r['price']}" if r.get("price") else "-"
-                vol_chg = (
-                    f"{r['vol_change_24h_pct']:.1f}%"
-                    if r.get("vol_change_24h_pct") != ""
-                    else "-"
-                )
-                vol = f"{r['vol_24h']:,.0f}" if r.get("vol_24h") != "" else "-"
-                price_chg = (
-                    f"{r['price_change_24h_pct']:.2f}%"
-                    if r.get("price_change_24h_pct")
-                    else "-"
-                )
-                is_new = name in _latest_new_symbols
-                is_exited = name in _latest_exited_symbols
-                if is_new:
-                    row_class = "row-new"
-                    badge = '<span class="badge-new">🆕 NEW</span>'
-                elif is_exited:
-                    row_class = "row-exited"
-                    badge = '<span class="badge-exited">🚫 EXIT</span>'
-                else:
-                    row_class = ""
-                    badge = ""
-                # 时间列：进入显示进入时间，退出显示退出时间（不显示进入时间）
-                if is_exited:
-                    time_label = _symbol_exit_time.get(name, "")
-                    time_cell_class = "time-cell time-exited"
-                else:
-                    time_label = _symbol_entry_time.get(name, "")
-                    time_cell_class = "time-cell"
-                rows_html += f"""\
-            <div class="grid-row {row_class}">
-                <div class="cell">{i}</div>
-                <div class="cell symbol-cell">{name}{badge}</div>
-                <div class="cell">{price}</div>
-                <div class="cell vol-change">{vol_chg}</div>
-                <div class="cell">{vol}</div>
-                <div class="cell">{price_chg}</div>
-                <div class="cell {time_cell_class}">{time_label}</div>
-            </div>
-"""
-            timestamp = _latest_timestamp
-            total = len(_latest_scan)
-            displayed = len(display)
-            hist = len(_seen_symbols)
-            new_count = len(_latest_new_symbols)
-            exited_count = len(_latest_exited_symbols)
-
-        return f"""\
+        """构建 JS 动态渲染的 HTML 页面。"""
+        return """\
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<meta http-equiv="refresh" content="60">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>币安永续合约 - 成交量异动监控</title>
 <style>
-* {{ margin: 0; padding: 0; box-sizing: border-box; }}
-body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-       background: #0b0e17; color: #e0e6f0; padding: 20px; }}
-.container {{ max-width: 1200px; margin: 0 auto; }}
-.header {{ background: linear-gradient(135deg, #1a2332 0%, #0f1923 100%);
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+       background: #0b0e17; color: #e0e6f0; padding: 20px; }
+.container { max-width: 1200px; margin: 0 auto; }
+.header { background: linear-gradient(135deg, #1a2332 0%, #0f1923 100%);
            border-radius: 12px; padding: 24px 28px; margin-bottom: 20px;
-           border: 1px solid #2a3a50; }}
-.header h1 {{ font-size: 22px; color: #f0b90b; margin-bottom: 8px; }}
-.header h1 small {{ font-size: 14px; color: #7a8da0; font-weight: normal; }}
-.stats {{ display: flex; gap: 20px; flex-wrap: wrap; margin-top: 12px; }}
-.stat-item {{ background: #1a2633; padding: 10px 18px; border-radius: 8px;
-              border: 1px solid #2a3a50; }}
-.stat-item .label {{ font-size: 12px; color: #7a8da0; }}
-.stat-item .value {{ font-size: 20px; font-weight: 600; color: #f0f4f8; }}
-.stat-item .value.new {{ color: #ff6b6b; animation: pulse-glow 1.5s ease-in-out infinite; }}
-.stat-item .value.exited {{ color: #ffa502; animation: pulse-glow-exit 1.5s ease-in-out infinite; }}
-@keyframes pulse-glow {{
-    0%, 100% {{ text-shadow: 0 0 8px rgba(255,107,107,0.4); }}
-    50% {{ text-shadow: 0 0 20px rgba(255,107,107,0.8); }}
-}}
-@keyframes pulse-glow-exit {{
-    0%, 100% {{ text-shadow: 0 0 8px rgba(255,165,2,0.4); }}
-    50% {{ text-shadow: 0 0 20px rgba(255,165,2,0.8); }}
-}}
-/* ===== CSS Grid 表格 ===== */
-.grid-table {{
-    display: grid;
-    grid-template-columns: 40px 2fr 1fr 1.2fr 1.5fr 1fr 1.5fr;
-    background: #111b26;
-    border-radius: 12px;
-    overflow: hidden;
-    border: 1px solid #2a3a50;
-}}
-.grid-header {{
-    display: contents;
-}}
-.grid-header .cell {{
-    background: #1a2332;
-    padding: 12px 16px;
-    font-size: 11px;
-    font-weight: 700;
-    color: #7a8da0;
-    text-transform: uppercase;
-    letter-spacing: 0.8px;
-    border-bottom: 1px solid #2a3a50;
-}}
-.grid-row {{
-    display: contents;
-}}
-.grid-row .cell {{
-    padding: 12px 16px;
-    font-size: 14px;
-    border-bottom: 1px solid #1c2a3a;
-    align-content: center;
-}}
-.grid-row:last-child .cell {{
-    border-bottom: none;
-}}
-.grid-row .cell:hover {{
-    background: #1a2635;
-}}
+           border: 1px solid #2a3a50; }
+.header h1 { font-size: 22px; color: #f0b90b; margin-bottom: 8px; }
+.header h1 small { font-size: 14px; color: #7a8da0; font-weight: normal; }
+.stats { display: flex; gap: 20px; flex-wrap: wrap; margin-top: 12px; }
+.stat-item { background: #1a2633; padding: 10px 18px; border-radius: 8px;
+             border: 1px solid #2a3a50; min-width: 100px; }
+.stat-item .label { font-size: 12px; color: #7a8da0; }
+.stat-item .value { font-size: 20px; font-weight: 600; color: #f0f4f8; }
+.stat-item .value.new { color: #2ecc71; animation: pulse-glow 1.5s ease-in-out infinite; }
+.stat-item .value.exited { color: #ffa502; animation: pulse-glow-exit 1.5s ease-in-out infinite; }
+@keyframes pulse-glow {
+    0%, 100% { text-shadow: 0 0 8px rgba(46,204,113,0.4); }
+    50% { text-shadow: 0 0 20px rgba(46,204,113,0.8); }
+}
+@keyframes pulse-glow-exit {
+    0%, 100% { text-shadow: 0 0 8px rgba(255,165,2,0.4); }
+    50% { text-shadow: 0 0 20px rgba(255,165,2,0.8); }
+}
+table { width: 100%; border-collapse: collapse; background: #111b26;
+        border-radius: 12px; overflow: hidden; border: 1px solid #2a3a50;
+        table-layout: auto; }
+th { background: #1a2332; padding: 12px 16px; font-size: 11px; font-weight: 700;
+     color: #7a8da0; text-transform: uppercase; letter-spacing: 0.8px;
+     border-bottom: 1px solid #2a3a50; text-align: left; white-space: nowrap; }
+td { padding: 12px 16px; font-size: 14px; border-bottom: 1px solid #1c2a3a;
+     white-space: nowrap; }
+tr:last-child td { border-bottom: none; }
+tr:hover td { background: #1a2635; }
 
-/* ===== 🆕 新增行（伪元素发光条用 cell->first-child 实现） ===== */
-.grid-row.row-new .cell:first-child {{
-    position: relative;
-    padding-left: 20px;
-}}
-.grid-row.row-new .cell:first-child::before {{
-    content: '';
+/* NEW 行（绿色竖条） */
+tr.row-new td:first-child { position: relative; padding-left: 20px; }
+tr.row-new td:first-child::before { content: '';
     position: absolute; left: 0; top: 4px; bottom: 4px; width: 4px;
-    background: linear-gradient(180deg, #ff6b6b, #ee5a24);
-    border-radius: 2px;
-    box-shadow: 0 0 10px rgba(255, 107, 107, 0.6);
-}}
-.grid-row.row-new .cell {{
-    background: linear-gradient(135deg, rgba(255, 107, 107, 0.12) 0%, rgba(255, 107, 107, 0.03) 100%);
-}}
+    background: linear-gradient(180deg, #2ecc71, #27ae60);
+    border-radius: 2px; box-shadow: 0 0 10px rgba(46,204,113,0.6); }
+tr.row-new td { background: linear-gradient(135deg,
+    rgba(46,204,113,0.12) 0%, rgba(46,204,113,0.03) 100%); }
+tr.row-new:hover td { background: linear-gradient(135deg,
+    rgba(46,204,113,0.22) 0%, rgba(46,204,113,0.06) 100%); }
 
-/* ===== 🚫 退出行 ===== */
-.grid-row.row-exited .cell:first-child {{
-    position: relative;
-    padding-left: 20px;
-}}
-.grid-row.row-exited .cell:first-child::before {{
-    content: '';
+/* EXIT 行 */
+tr.row-exited td:first-child { position: relative; padding-left: 20px; }
+tr.row-exited td:first-child::before { content: '';
     position: absolute; left: 0; top: 4px; bottom: 4px; width: 4px;
     background: linear-gradient(180deg, #ffa502, #e67e22);
-    border-radius: 2px;
-    box-shadow: 0 0 10px rgba(255, 165, 2, 0.5);
-}}
-.grid-row.row-exited .cell {{
-    background: linear-gradient(135deg, rgba(255, 165, 2, 0.10) 0%, rgba(255, 165, 2, 0.02) 100%);
-}}
+    border-radius: 2px; box-shadow: 0 0 10px rgba(255,165,2,0.5); }
+tr.row-exited td { background: linear-gradient(135deg,
+    rgba(255,165,2,0.10) 0%, rgba(255,165,2,0.02) 100%); }
+tr.row-exited:hover td { background: linear-gradient(135deg,
+    rgba(255,165,2,0.18) 0%, rgba(255,165,2,0.05) 100%); }
 
-.symbol-cell {{ font-weight: 600; color: #f0f4f8; }}
-
-/* ===== NEW 徽章 ===== */
-.badge-new {{
-    display: inline-block; margin-left: 8px; padding: 3px 10px;
-    background: linear-gradient(135deg, #ff6b6b, #ee5a24, #ff6b6b);
-    background-size: 200% 100%;
-    border-radius: 12px; font-size: 11px; font-weight: 700;
-    color: white; letter-spacing: 0.5px;
-    box-shadow: 0 0 12px rgba(255, 107, 107, 0.4);
-    animation: badge-shine 2s ease-in-out infinite, pulse-glow 1.5s ease-in-out infinite;
-}}
-
-/* ===== EXIT 徽章 ===== */
-.badge-exited {{
-    display: inline-block; margin-left: 8px; padding: 3px 10px;
-    background: linear-gradient(135deg, #ffa502, #e67e22, #ffa502);
-    background-size: 200% 100%;
-    border-radius: 12px; font-size: 11px; font-weight: 700;
-    color: white; letter-spacing: 0.5px;
-    box-shadow: 0 0 10px rgba(255, 165, 2, 0.3);
-    animation: badge-shine 2.5s ease-in-out infinite, pulse-glow-exit 1.5s ease-in-out infinite;
-}}
-
-@keyframes badge-shine {{
-    0% {{ background-position: 0% 50%; }}
-    50% {{ background-position: 100% 50%; }}
-    100% {{ background-position: 0% 50%; }}
-}}
-
-.vol-change {{ color: #ff6b6b; font-weight: 600; }}
-.time-cell {{ font-size: 12px; color: #8a9aaa; white-space: nowrap; }}
-.time-exited {{ color: #ffa502; font-weight: 600; }}
-.footer {{ text-align: center; margin-top: 20px; color: #4a5a6a; font-size: 13px; }}
+.symbol-cell { font-weight: 600; color: #f0f4f8; }
+.vol-change { color: #ff6b6b; font-weight: 600; }
+.time-cell { font-size: 12px; color: #8a9aaa; white-space: nowrap; }
+.time-exited { color: #ffa502; font-weight: 600; }
+.footer { text-align: center; margin-top: 20px; color: #4a5a6a; font-size: 13px; }
+.loading { text-align: center; padding: 60px; color: #6a7a8a; font-size: 16px; }
 </style>
 </head>
 <body>
 <div class="container">
     <div class="header">
         <h1>📊 币安永续合约 · 24h成交量异动监控 <small>TradingView Scanner</small></h1>
-        <div class="stats">
-            <div class="stat-item">
-                <div class="label">最后更新</div>
-                <div class="value">{timestamp or "等待中..."}</div>
-            </div>
-            <div class="stat-item">
-                <div class="label">当前结果</div>
-                <div class="value">{total}</div>
-            </div>
-            <div class="stat-item">
-                <div class="label">1h内新增</div>
-                <div class="value new">{new_count}</div>
-            </div>
-            <div class="stat-item">
-                <div class="label">已退出</div>
-                <div class="value exited">{exited_count}</div>
-            </div>
-            <div class="stat-item">
-                <div class="label">历史累计</div>
-                <div class="value">{hist}</div>
-            </div>
+        <div class="stats" id="stats">
+            <div class="stat-item"><div class="label">最后更新</div><div class="value" id="stat-time">-</div></div>
+            <div class="stat-item"><div class="label">当前结果</div><div class="value" id="stat-total">-</div></div>
+            <div class="stat-item"><div class="label">1h内新增</div><div class="value" id="stat-new">-</div></div>
+            <div class="stat-item"><div class="label">已退出</div><div class="value" id="stat-exited">-</div></div>
+            <div class="stat-item"><div class="label">历史累计</div><div class="value" id="stat-hist">-</div></div>
         </div>
     </div>
-    <div class="grid-table">
-        <div class="grid-header">
-            <div class="cell">#</div>
-            <div class="cell">交易对</div>
-            <div class="cell">价格</div>
-            <div class="cell">24h量变化</div>
-            <div class="cell">24h成交量</div>
-            <div class="cell">24h价变化</div>
-            <div class="cell">进入/退出时间</div>
-        </div>
-        {rows_html if rows_html else '<div class="grid-row"><div class="cell" style="grid-column:1/-1;text-align:center;padding:40px;color:#6a7a8a;font-size:16px">暂无数据，等待首次扫描...</div></div>'}
-    </div>
-    <div class="footer">
-        页面每 60 秒自动刷新 &nbsp;|&nbsp; 条件: 24h成交量变化 &gt; {MIN_VOL_CHANGE_PCT}% &nbsp;|&nbsp;
-        更新间隔: {INTERVAL_SECONDS}s &nbsp;|&nbsp; 显示 {displayed}/{total} 条 &nbsp;|&nbsp;
-        🆕 红色行=1小时内新增 &nbsp;|&nbsp; 🚫 橙色行=已退出交易对
+    <table>
+        <thead>
+            <tr>
+                <th>#</th>
+                <th>交易对</th>
+                <th>价格</th>
+                <th>24h量变化</th>
+                <th>24h成交量</th>
+                <th>24h价变化</th>
+                <th>进入/退出时间</th>
+            </tr>
+        </thead>
+        <tbody id="table-body"><tr><td colspan="7" style="text-align:center;padding:40px;color:#6a7a8a">加载中...</td></tr></tbody>
+    </table>
+    <div class="footer" id="footer">
+        条件: 24h成交量变化 &gt; 800% &nbsp;|&nbsp; 更新间隔: 60s &nbsp;|&nbsp; 🟢 绿色竖条=1小时内新增 &nbsp;|&nbsp; 🟠 橙色竖条=已退出
     </div>
 </div>
+<script>
+const MAX = 30;
+// 浏览器通知：已通知过的交易对集合，避免重复弹窗
+let _notifiedNew = new Set();
+
+// 请求通知权限
+if ('Notification' in window && Notification.permission === 'default') {
+    Notification.requestPermission();
+}
+
+function sendNewPairNotification(symbol, volChange, priceChange) {
+    if (!('Notification' in window) || Notification.permission !== 'granted') return;
+    if (_notifiedNew.has(symbol)) return;
+    _notifiedNew.add(symbol);
+
+    try {
+        const n = new Notification('📈 成交量异动 · 新交易对', {
+            body: symbol + '\\n24h量变化: ' + volChange + '\\n24h价变化: ' + priceChange,
+            icon: 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y=".9em" font-size="80">📊</text></svg>'),
+            tag: 'vol-surge-' + symbol,
+            requireInteraction: true
+        });
+        // 点击通知跳转到页面
+        n.onclick = function () { window.focus(); this.close(); };
+        // 5秒后自动关闭
+        setTimeout(() => n.close(), 5000);
+    } catch (e) {
+        // 静默失败
+    }
+}
+
+function fmt(n) { try { return Number(n).toLocaleString(); } catch { return '-'; } }
+function fmt1(n) { try { return Number(n).toFixed(1) + '%'; } catch { return '-'; } }
+function fmt2(n) { try { return Number(n).toFixed(2) + '%'; } catch { return '-'; } }
+function esc(s) { return String(s).replace(/[&<>"]/g,function(c){
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]||c; }); }
+
+async function fetchData() {
+    try {
+        const api = '/api/data';
+        const r = await fetch(api, { cache: 'no-cache' });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const d = await r.json();
+        render(d);
+        // 检查新交易对并发送通知
+        checkNewSymbols(d);
+    } catch(e) {
+        document.getElementById('table-body').innerHTML =
+            '<tr><td colspan="7" style="text-align:center;padding:40px;color:#ff6b6b;font-size:16px">\u26a0\ufe0f ' + e.message + '</td></tr>';
+    }
+}
+
+function checkNewSymbols(d) {
+    const newSymbols = d.latest_new_symbols || [];
+    if (newSymbols.length === 0) return;
+
+    // 构建一个 name -> result 的映射
+    const resultMap = {};
+    (d.results || []).forEach(r => { resultMap[r.name] = r; });
+
+    for (const sym of newSymbols) {
+        const r = resultMap[sym];
+        const volChg = r ? fmt1(r.vol_change_24h_pct) : '-';
+        const priceChg = r ? fmt2(r.price_change_24h_pct) : '-';
+        sendNewPairNotification(sym, volChg, priceChg);
+    }
+}
+
+function render(d) {
+    // 统计
+    document.getElementById('stat-time').textContent = d.timestamp || '-';
+    document.getElementById('stat-total').textContent = d.total;
+    const newEl = document.getElementById('stat-new');
+    newEl.textContent = d.latest_new_count;
+    newEl.className = 'value' + (d.latest_new_count > 0 ? ' new' : '');
+    const extEl = document.getElementById('stat-exited');
+    extEl.textContent = d.latest_exited_count;
+    extEl.className = 'value' + (d.latest_exited_count > 0 ? ' exited' : '');
+    document.getElementById('stat-hist').textContent = d.history_total;
+
+    // 表
+    const results = d.results || [];
+    const limit = Math.min(results.length, MAX);
+    const newSet = new Set(d.latest_new_symbols || []);
+    const extSet = new Set(d.latest_exited_symbols || []);
+
+    let html = '';
+    for (let i = 0; i < limit; i++) {
+        const r = results[i];
+        const name = esc(r.name);
+        const isNew = newSet.has(r.name);
+        const isExt = extSet.has(r.name);
+        const rowClass = isNew ? 'row-new' : (isExt ? 'row-exited' : '');
+
+        let badge = '';  // 只用颜色竖条，不需要文字徽章
+
+        const price = r.price ? esc(String(r.price)) : '-';
+        const volChg = fmt1(r.vol_change_24h_pct);
+        const vol = fmt(r.vol_24h);
+        const priceChg = fmt2(r.price_change_24h_pct);
+
+        let timeLabel, timeClass;
+        if (isExt) {
+            timeLabel = r.exit_time || '-';
+            timeClass = 'time-cell time-exited';
+        } else {
+            timeLabel = r.entry_time || '-';
+            timeClass = 'time-cell';
+        }
+
+        html += '<tr class="' + rowClass + '">' +
+            '<td>' + (i + 1) + '</td>' +
+            '<td class="symbol-cell">' + name + badge + '</td>' +
+            '<td>' + price + '</td>' +
+            '<td class="vol-change">' + volChg + '</td>' +
+            '<td>' + vol + '</td>' +
+            '<td>' + priceChg + '</td>' +
+            '<td class="' + timeClass + '">' + timeLabel + '</td>' +
+            '</tr>';
+    }
+
+    if (results.length > MAX) {
+        html += '<tr><td colspan="7" style="text-align:center;padding:8px;color:#6a7a8a;font-size:13px">... 还有 ' + (results.length - MAX) + ' 个未显示</td></tr>';
+    }
+
+    document.getElementById('table-body').innerHTML = html || '<tr><td colspan="7" style="text-align:center;padding:40px;color:#6a7a8a;font-size:16px">暂无数据</td></tr>';
+}
+
+fetchData();
+setInterval(fetchData, 10000);
+</script>
 </body>
 </html>"""
 
@@ -354,6 +477,7 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans
 def start_http_server():
     """在后台线程启动 HTTP 服务器。"""
     server = HTTPServer(("0.0.0.0", HTTP_PORT), VolumeSurgeHandler)
+    server.timeout = 0.5
     thread = threading.Thread(
         target=server.serve_forever, daemon=True, name="HttpServer"
     )
@@ -597,12 +721,19 @@ def print_results(
     print("-" * 114)
     for i, r in enumerate(display, 1):
         name = r["name"]
-        price = f"{r['price']}"
-        vol_chg = f"{r['vol_change_24h_pct']:.1f}%"
-        vol = f"{r['vol_24h']:,.0f}"
-        price_chg = (
-            f"{r['price_change_24h_pct']:.2f}%" if r["price_change_24h_pct"] else "N/A"
-        )
+        price = f"{r['price']}" if r.get("price") else "-"
+        try:
+            vol_chg = f"{float(r['vol_change_24h_pct']):.1f}%"
+        except (ValueError, TypeError):
+            vol_chg = "-"
+        try:
+            vol = f"{float(r['vol_24h']):,.0f}"
+        except (ValueError, TypeError):
+            vol = "-"
+        try:
+            price_chg = f"{float(r['price_change_24h_pct']):.2f}%"
+        except (ValueError, TypeError):
+            price_chg = "-"
         if name in new_names:
             tag = "🆕 NEW"
         elif name in exited_names:
