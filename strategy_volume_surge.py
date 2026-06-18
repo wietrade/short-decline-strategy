@@ -44,7 +44,9 @@ class VolumeSurgeShortStrategy(IStrategy):
     position_adjustment_enable = False
 
     # ── 风控 ──
-    stoploss = -0.05  # 备用（实际由 custom_stoploss 按开仓价计算）
+    stoploss = (
+        -0.50
+    )  # 备用下限（实际由 custom_stoploss 计算，5%价格=50%保证金亏损@10x）
     trailing_stop = False
     use_custom_stoploss = True
     use_exit_signal = True  # 允许 populate_exit_trend 信号平仓
