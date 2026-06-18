@@ -73,9 +73,9 @@ class VolumeSurgeShortStrategy(IStrategy):
     _api_lock = threading.Lock()
     _api_update_interval = 60  # 每 60 秒刷新一次
 
-    # ── 最低价追踪缓存 ──
-    # 记录每个 trade.id 达到的最低价格（做空最优点），用于计算价格回撤
-    _lowest_rates: dict = {}
+    # ── 移动止盈状态缓存 ──
+    _lowest_rates: dict = {}  # trade.id → 最低价（做空最优点）
+    _trailing_activated: set = set()  # 已激活追踪止盈的 trade.id
 
     # ── 自定义离场 ──
 
@@ -92,15 +92,10 @@ class VolumeSurgeShortStrategy(IStrategy):
         移动止盈（基于价格回撤）+ 异动列表退出。
         populate_exit_trend 负责异动列表退出的信号。
         """
-        # 价格反弹超过阈值 → 通过离场信号平仓（兜底）
-        if trade.id in self._lowest_rates:
+        # 移动止盈：已激活追踪且价格反弹超过阈值 → 平仓
+        if trade.id in self._trailing_activated and trade.id in self._lowest_rates:
             lowest = self._lowest_rates[trade.id]
-            # 基于价格计算：价格从开仓价下跌比例达到阈值才激活追踪
-            price_drop_pct = (trade.open_rate - current_rate) / trade.open_rate
-            if (
-                lowest < current_rate
-                and price_drop_pct >= self.trailing_tp_activate_price_pct
-            ):
+            if lowest < current_rate:
                 retracement = (current_rate - lowest) / lowest
                 if retracement >= self.trailing_tp_distance:
                     return f"trailing_tp_{retracement:.1%}"
@@ -118,22 +113,18 @@ class VolumeSurgeShortStrategy(IStrategy):
         **kwargs,
     ) -> float:
         """
-        做空止损 + 价格回撤移动止盈。
+        硬止损（基于开仓价格计算）。
+        移动止盈由 custom_exit 独立处理。
 
-        两层保护：
-          1. 硬止损：价格从开仓价反向波动 >= 5%（= 50U）时止损
-             - 基于开仓价格计算：price_rise% = (current_rate / open_rate) - 1
-             - 与杠杆倍数无关，直接控制价格止损距离
-             - 100U 保证金 × 10 倍杠杆 = 1000U 名义价值，反向 5% = 亏损 50U
-          2. 移动止盈：价格从开仓价下跌 >= 5%（= 盈利 50U）后激活，追踪最低价，价格反弹 4% 即平仓
-             - 例：价格 100→80→83.2（反弹 4%），止盈锁定 16.8U 利润
+        保护：
+          硬止损：价格从开仓价反向波动 >= 5%（= 50U）时止损
+          - 基于开仓价格计算：price_rise% = (current_rate / open_rate) - 1
+          - 与杠杆倍数无关，直接控制价格止损距离
+          - 100U 保证金 × 10 倍杠杆 = 1000U 名义价值，反向 5% = 亏损 50U
 
-        原理：
-          - 硬止损使用开仓价计算价格涨幅，不受 current_profit 杠杆影响
-          - 移动止盈追踪做空期间的最低价格（最佳盈利点）
-          - 计算当前价格相对最低价的反弹幅度
-          - 反弹超过 4% → 平仓锁利
-          - 同时通过 stoploss 设置防守价位，防止价格突然跳空穿透
+        状态标记：
+          追踪最低价（做空最优价格）
+          标记移动止盈已激活（由 custom_exit 消费）
         """
         # ── 硬止损（基于开仓价格计算） ──
         price_rise_pct = (current_rate / trade.open_rate) - 1
@@ -147,25 +138,12 @@ class VolumeSurgeShortStrategy(IStrategy):
             if current_rate < self._lowest_rates[trade.id]:
                 self._lowest_rates[trade.id] = current_rate  # 价格新低，更新
 
-        lowest = self._lowest_rates[trade.id]
-
-        # ── 移动止盈（基于价格计算） ──
+        # ── 标记移动止盈激活 ──
         price_drop_pct = (trade.open_rate - current_rate) / trade.open_rate
         if price_drop_pct >= self.trailing_tp_activate_price_pct:
-            # 当前价格相对最低价的反弹比例
-            retracement = (current_rate - lowest) / lowest
+            self._trailing_activated.add(trade.id)
 
-            if retracement >= self.trailing_tp_distance:
-                # 反弹超过阈值 → 在当前价位触发平仓
-                return current_profit
-
-            # 未超阈值：将止损价位设在「最低价 × (1 + 回撤距离)」
-            # 做空正止盈: stop_price = open_rate × (1 - stoploss)
-            # => stoploss = 1 - (lowest × (1 + distance) / open_rate)
-            stoploss = 1 - (lowest * (1 + self.trailing_tp_distance) / trade.open_rate)
-            return stoploss
-
-        # ── 默认：保持硬止损价位（基于开仓价格计算） ──
+        # ── 保持硬止损价位（基于开仓价格计算） ──
         return -self.stoploss_price_pct * trade.leverage
 
     # ── 杠杆设置 ──
