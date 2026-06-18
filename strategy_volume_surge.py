@@ -35,11 +35,10 @@ class VolumeSurgeShortStrategy(IStrategy):
     # 实盘建议 1m，回测可用 15m
     timeframe = "15m"
 
-    # ── 期货做空（10 倍杠杆） ──
+    # ── 期货做空（杠杆由配置文件 config_trade_surge.json 控制） ──
     trading_mode = "futures"
     margin_mode = "isolated"
     can_short = True
-    leverage = 10.0
 
     # ── DCA 设置（不启用多次加仓） ──
     position_adjustment_enable = False
@@ -137,7 +136,7 @@ class VolumeSurgeShortStrategy(IStrategy):
         # ── 硬止损（基于开仓价格计算） ──
         price_rise_pct = (current_rate / trade.open_rate) - 1
         if price_rise_pct >= self.stoploss_price_pct:
-            return -self.stoploss_price_pct * self.leverage
+            return -self.stoploss_price_pct * trade.leverage
 
         # ── 追踪最低价（做空最佳价格） ──
         if trade.id not in self._lowest_rates:
@@ -165,7 +164,7 @@ class VolumeSurgeShortStrategy(IStrategy):
             return stoploss
 
         # ── 默认：保持硬止损价位（基于开仓价格计算） ──
-        return -self.stoploss_price_pct * self.leverage
+        return -self.stoploss_price_pct * trade.leverage
 
     # ── API 数据获取 ──
 
@@ -257,7 +256,7 @@ class VolumeSurgeShortStrategy(IStrategy):
         side: str,
         **kwargs,
     ) -> float:
-        """初始开仓使用固定的 10U 保证金"""
+        """初始开仓使用固定的 100U 保证金"""
         if side == "short":
             return self.base_short_amount
         return proposed_stake
