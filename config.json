@@ -1,7 +1,7 @@
 {
-    "max_open_trades": 20,
+    "max_open_trades": 10,
     "stake_currency": "USDT",
-    "stake_amount": 10,
+    "stake_amount": 100,
     "dry_run": true,
     "dry_run_wallet": 1000,
     "trading_mode": "futures",

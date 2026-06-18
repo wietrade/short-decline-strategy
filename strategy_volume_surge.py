@@ -5,11 +5,11 @@
 
 核心逻辑：
   1. 轮询 43.165.167.132:3001 获取 24h 成交量暴涨 >800% 的币安永续合约交易对
-  2. 新出现的交易对（启动API之后才出现的）→ 立即以 10U 保证金、10 倍杠杆市价开空
-  3. 移动止盈: 盈利 >= 1U 后激活，价格从最低点反弹 2% 即平仓
-  4. 硬止损: 开仓价反向波动 0.5% 即止损（基于开仓价格计算）
+  2. 新出现的交易对（启动API之后才出现的）→ 立即以 100U 保证金、10 倍杠杆市价开空
+  3. 移动止盈: 价格下跌 >= 0.5%（= 盈利 5U）后激活，价格从最低点反弹 0.4% 即平仓
+  4. 硬止损: 开仓价反向波动 0.5%（= 亏损 5U）即止损（基于开仓价格计算）
   5. 交易对退出异动列表时平仓
-  6. 总模拟资金 1000U，单笔保证金 10U，最多同时持仓 20 个
+  6. 总模拟资金 1000U，单笔保证金 100U，最多同时持仓 10 个
 
 作者: auto-generated
 """
@@ -52,14 +52,18 @@ class VolumeSurgeShortStrategy(IStrategy):
     exit_profit_only = False
 
     # ── 资金管理 ──
-    stake_amount = 10  # 每笔保证金 10U
+    stake_amount = 100  # 每笔保证金 100U
 
     # ── 参数（可通过 Freqtrade 配置覆盖） ──
     surge_api_url = "http://43.165.167.132:3001/api/list"
-    base_short_amount = 10  # 每笔开仓保证金 10U（名义价值 100U @10x）
-    stoploss_price_pct = 0.005  # 硬止损：开仓价反向波动 0.5%（= 0.5U）即止损
-    trailing_tp_activate = 0.10  # 移动止盈激活阈值（盈利 10% = 1U 时开始追踪）
-    trailing_tp_distance = 0.02  # 移动止盈回撤距离（从最高盈利回撤 2% 即平仓）
+    base_short_amount = 100  # 每笔开仓保证金 100U（名义价值 1000U @10x）
+    stoploss_price_pct = 0.005  # 硬止损：开仓价反向波动 0.5%（= 5U）即止损
+    trailing_tp_activate_price_pct = (
+        0.005  # 移动止盈激活阈值：价格从开仓价下跌 0.5%（= 盈利 5U）开始追踪
+    )
+    trailing_tp_distance = (
+        0.004  # 移动止盈回撤距离：价格从最低点反弹 0.4%（= 回撤 4U）即平仓
+    )
 
     # ── API 缓存 ──
     _surge_pairs: list = []
@@ -90,7 +94,12 @@ class VolumeSurgeShortStrategy(IStrategy):
         # 价格反弹超过阈值 → 通过离场信号平仓（兜底）
         if trade.id in self._lowest_rates:
             lowest = self._lowest_rates[trade.id]
-            if lowest < current_rate and current_profit >= self.trailing_tp_activate:
+            # 基于价格计算：价格从开仓价下跌比例达到阈值才激活追踪
+            price_drop_pct = (trade.open_rate - current_rate) / trade.open_rate
+            if (
+                lowest < current_rate
+                and price_drop_pct >= self.trailing_tp_activate_price_pct
+            ):
                 retracement = (current_rate - lowest) / lowest
                 if retracement >= self.trailing_tp_distance:
                     return f"trailing_tp_{retracement:.1%}"
@@ -114,8 +123,9 @@ class VolumeSurgeShortStrategy(IStrategy):
           1. 硬止损：价格从开仓价反向波动 >= 0.5%（= 5U）时止损
              - 基于开仓价格计算：price_rise% = (current_rate / open_rate) - 1
              - 与杠杆倍数无关，直接控制价格止损距离
-          2. 移动止盈：盈利 >= 10% 后激活，追踪最低价，价格反弹 2% 即平仓
-             - 例：价格 100→85→86.7（反弹 2%），止盈锁定 13.3% 利润
+             - 100U 保证金 × 10 倍杠杆 = 1000U 名义价值，反向 0.5% = 亏损 5U
+          2. 移动止盈：价格从开仓价下跌 >= 0.5%（= 盈利 5U）后激活，追踪最低价，价格反弹 0.4% 即平仓
+             - 例：价格 100→94→94.38（反弹 0.4%），止盈锁定 5.6U 利润
 
         原理：
           - 硬止损使用开仓价计算价格涨幅，不受 current_profit 杠杆影响
@@ -138,8 +148,9 @@ class VolumeSurgeShortStrategy(IStrategy):
 
         lowest = self._lowest_rates[trade.id]
 
-        # ── 移动止盈 ──
-        if current_profit >= self.trailing_tp_activate:
+        # ── 移动止盈（基于价格计算） ──
+        price_drop_pct = (trade.open_rate - current_rate) / trade.open_rate
+        if price_drop_pct >= self.trailing_tp_activate_price_pct:
             # 当前价格相对最低价的反弹比例
             retracement = (current_rate - lowest) / lowest
 
