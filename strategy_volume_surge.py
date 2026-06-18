@@ -166,6 +166,22 @@ class VolumeSurgeShortStrategy(IStrategy):
         # ── 默认：保持硬止损价位（基于开仓价格计算） ──
         return -self.stoploss_price_pct * trade.leverage
 
+    # ── 杠杆设置 ──
+
+    def leverage(
+        self,
+        pair: str,
+        current_time: datetime,
+        current_rate: float,
+        proposed_leverage: float,
+        max_leverage: float,
+        entry_tag: Optional[str],
+        side: str,
+        **kwargs,
+    ) -> float:
+        """从配置文件读取杠杆倍数（config_trade_surge.json → futures_leverage）"""
+        return self.config.get("futures_leverage", 1)
+
     # ── API 数据获取 ──
 
     def _fetch_surge_pairs(self) -> None:
