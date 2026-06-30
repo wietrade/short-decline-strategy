@@ -11,8 +11,9 @@ import sqlite3
 import threading
 import time
 from datetime import datetime, timedelta
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 
@@ -21,9 +22,12 @@ MIN_VOL_CHANGE_PCT = 500  # 24h 成交量变化最小百分比
 MAX_RESULTS = 200  # 最大结果数
 INTERVAL_SECONDS = 60  # 更新间隔（秒），60 = 1分钟
 DB_PATH = Path(__file__).parent / "data" / "volume_surge.db"
+HTTP_HOST = "127.0.0.1"  # 仅本机监听，由 Nginx 反代到公网域名
 HTTP_PORT = 3001  # HTTP 服务器端口
 MAX_DISPLAY_RESULTS = 30  # 最多显示记录数
 MAX_HISTORY_RECORDS = 50  # 数据库最多保留记录数
+RECENT_ENTRY_MINUTES = 60  # 给 Freqtrade 拉取新增交易对的容错窗口
+HTTP_REQUEST_TIMEOUT = 10  # 防止半开连接阻塞 HTTP 线程
 # ==============================================
 
 # 全局状态
@@ -42,6 +46,7 @@ signal.signal(signal.SIGTERM, signal_handler)
 
 # ================ HTTP 服务器全局状态 ================
 _latest_scan: list[dict] = []
+_latest_active_scan: list[dict] = []
 _latest_new_symbols: set[str] = set()
 _latest_exited_symbols: set[str] = set()
 _latest_timestamp: str = ""
@@ -66,14 +71,19 @@ class VolumeSurgeHandler(BaseHTTPRequestHandler):
     # 关闭 HTTP keep-alive，防止 socket 泄漏（CLOSE-WAIT）
     close_connection = True
 
+    def setup(self):
+        self.request.settimeout(HTTP_REQUEST_TIMEOUT)
+        super().setup()
+
     def do_GET(self):
-        if self.path == "/api/data":
+        path = urlparse(self.path).path
+        if path == "/api/data":
             self._serve_json()
-        elif self.path == "/api/list":
+        elif path == "/api/list":
             self._serve_list()
-        elif self.path == "/api/pairlist":
+        elif path == "/api/pairlist":
             self._serve_pairlist()
-        elif self.path == "/" or self.path == "/index.html":
+        elif path == "/" or path == "/index.html":
             self._serve_html()
         else:
             self.send_response(404)
@@ -146,19 +156,19 @@ class VolumeSurgeHandler(BaseHTTPRequestHandler):
 
     def _serve_list(self):
         """
-        /api/list — 仅返回最近1小时内进入的交易对及趋势数据，供 Freqtrade 策略使用。
+        /api/list — 仅返回最近进入且仍活跃的交易对及趋势数据，供 Freqtrade 策略使用。
         返回格式: [{"pair": "SAFE/USDT", "perf_1w": -10.87, ...}]
         """
-        one_min_ago = (datetime.now() - timedelta(minutes=1)).strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
+        recent_cutoff = (
+            datetime.now() - timedelta(minutes=RECENT_ENTRY_MINUTES)
+        ).strftime("%Y-%m-%d %H:%M:%S")
         with _scan_lock:
             results = []
-            for r in _latest_scan:
+            for r in _latest_active_scan:
                 name = r.get("name", "")
                 entry = _symbol_entry_time.get(name, "")
-                if not entry or entry < one_min_ago:
-                    continue  # 仅返回最近1分钟内进入的交易对给Freqtrade
+                if not entry or entry < recent_cutoff:
+                    continue
                 pair = self._tv_to_pair(name)
                 results.append(
                     {
@@ -183,21 +193,14 @@ class VolumeSurgeHandler(BaseHTTPRequestHandler):
 
     def _serve_pairlist(self):
         """
-        /api/pairlist — 仅返回最近1小时内进入的交易对（按成交量降序），供 Freqtrade RemotePairList 使用。
+        /api/pairlist - 返回当前仍活跃的交易对（按成交量降序），供 Freqtrade RemotePairList 使用。
         Binance 合约 (swap) 格式需要 ":USDT" 后缀才能被 expand_pairlist 匹配。
         返回格式: {"pairs": ["SAFE/USDT:USDT", "ME/USDT:USDT", ...], "refresh_period": 60}
         """
-        one_min_ago = (datetime.now() - timedelta(minutes=1)).strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
         with _scan_lock:
             items = []
-            for r in _latest_scan:
-                name = r.get("name", "")
-                entry = _symbol_entry_time.get(name, "")
-                if not entry or entry < one_min_ago:
-                    continue  # 仅返回最近1分钟内进入的交易对给Freqtrade
-                pair = self._tv_to_pair(name)
+            for r in _latest_active_scan:
+                pair = self._tv_to_pair(r.get("name", ""))
                 # Binance 合约格式: expand_pairlist 需带 :USDT 后缀才能匹配
                 if pair.endswith("/USDT"):
                     pair = f"{pair}:USDT"
@@ -206,7 +209,11 @@ class VolumeSurgeHandler(BaseHTTPRequestHandler):
                 vol = r.get("vol_24h")
                 if vol is None or vol == "":
                     vol = 0
-                items.append((pair, float(vol)))
+                try:
+                    vol_value = float(vol)
+                except (TypeError, ValueError):
+                    vol_value = 0
+                items.append((pair, vol_value))
             # 按成交量降序排序
             items.sort(key=lambda x: x[1], reverse=True)
             pairlist = [p[0] for p in items]
@@ -486,8 +493,9 @@ setInterval(fetchData, 10000);
 
 def start_http_server():
     """在后台线程启动 HTTP 服务器。"""
-    server = HTTPServer(("0.0.0.0", HTTP_PORT), VolumeSurgeHandler)
+    server = ThreadingHTTPServer((HTTP_HOST, HTTP_PORT), VolumeSurgeHandler)
     server.timeout = 0.5
+    server.daemon_threads = True
     thread = threading.Thread(
         target=server.serve_forever, daemon=True, name="HttpServer"
     )
@@ -671,7 +679,7 @@ def load_from_db():
 def save_to_db(new_entries: list[dict], timestamp: str) -> tuple[int, list[str]]:
     """保存新增交易对到数据库，并清理超出 MAX_HISTORY_RECORDS 的旧数据。
     返回 (新增数量, 新增name列表)。"""
-    global _seen_symbols, _symbol_entry_time
+    global _seen_symbols, _symbol_entry_time, _symbol_exit_time
 
     fresh = [r for r in new_entries if r["name"] not in _seen_symbols]
     if not fresh:
@@ -679,6 +687,7 @@ def save_to_db(new_entries: list[dict], timestamp: str) -> tuple[int, list[str]]
 
     conn = get_db()
     fresh_names = []
+    active_names = [r["name"] for r in new_entries]
     for r in fresh:
         conn.execute(
             "INSERT OR IGNORE INTO symbols (name, entry_time, symbol) VALUES (?, ?, ?)",
@@ -688,12 +697,28 @@ def save_to_db(new_entries: list[dict], timestamp: str) -> tuple[int, list[str]]
         _symbol_entry_time[r["name"]] = timestamp
         fresh_names.append(r["name"])
 
-    # 清理：只保留最新的 MAX_HISTORY_RECORDS 条
-    conn.execute(f"""
-        DELETE FROM symbols WHERE name IN (
-            SELECT name FROM symbols ORDER BY entry_time DESC LIMIT -1 OFFSET {MAX_HISTORY_RECORDS}
+    # 清理：保留当前活跃交易对，只删除超过上限的旧历史记录
+    placeholders = ",".join("?" for _ in active_names)
+    stale_rows = conn.execute(
+        f"""
+        SELECT name FROM symbols
+        WHERE name NOT IN ({placeholders})
+        ORDER BY entry_time DESC
+        LIMIT -1 OFFSET ?
+        """,
+        (*active_names, MAX_HISTORY_RECORDS),
+    ).fetchall()
+    stale_names = [row["name"] for row in stale_rows]
+    if stale_names:
+        stale_placeholders = ",".join("?" for _ in stale_names)
+        conn.execute(
+            f"DELETE FROM symbols WHERE name IN ({stale_placeholders})",
+            stale_names,
         )
-    """)
+        for name in stale_names:
+            _seen_symbols.discard(name)
+            _symbol_entry_time.pop(name, None)
+            _symbol_exit_time.pop(name, None)
     conn.commit()
     conn.close()
     return len(fresh), fresh_names
@@ -787,6 +812,7 @@ def main_loop():
     global \
         _seen_symbols, \
         _latest_scan, \
+        _latest_active_scan, \
         _latest_new_symbols, \
         _latest_exited_symbols, \
         _latest_timestamp, \
@@ -807,9 +833,10 @@ def main_loop():
     print(f"  阈值: 24h成交量变化 > {MIN_VOL_CHANGE_PCT}%")
     print(f"  最多显示: {MAX_DISPLAY_RESULTS} 条")
     print(f"  数据库最多保留: {MAX_HISTORY_RECORDS} 条记录")
+    print(f"  交易接口新增窗口: {RECENT_ENTRY_MINUTES} 分钟")
     print(f"  数据库: {DB_PATH}")
     print(f"  历史已记录: {len(_seen_symbols)} 个交易对")
-    print(f"  HTTP 显示: http://localhost:{HTTP_PORT}")
+    print(f"  HTTP 显示: http://{HTTP_HOST}:{HTTP_PORT}")
     print("  按 Ctrl+C 停止\n")
 
     error_count = 0
@@ -820,16 +847,12 @@ def main_loop():
             current_names = {r["name"] for r in results}
             name_to_data = {r["name"]: r for r in results}
 
-            # ── 所有 >500% 的交易对都视为活跃 ──
-            _active_symbols = set(current_names)
-
             # ── 检测退出并写入DB ──
             newly_exited = set()
             if _previous_scan_symbols:
                 newly_exited = _previous_scan_symbols - current_names
                 for en in newly_exited:
                     update_exit_in_db(en, timestamp)
-                    _active_symbols.discard(en)
             _previous_scan_symbols = set(current_names)
 
             # ── 构建活跃交易对数据列表 ──
@@ -898,8 +921,10 @@ def main_loop():
 
             # 更新 HTTP 全局状态
             with _scan_lock:
-                # _latest_scan 仅保留当前活跃（>500%）的交易对
-                _latest_scan = list(active_data)
+                # _latest_scan 用于页面展示，包含当前活跃和已退出记录
+                _latest_scan = list(all_display)
+                # _latest_active_scan 用于 Freqtrade 拉取，只包含当前仍 >500% 的交易对
+                _latest_active_scan = list(active_data)
                 _latest_timestamp = timestamp
                 _latest_new_symbols = new_names_set
                 _latest_exited_symbols = exited_names_set

@@ -87,9 +87,9 @@ screen -wipe
 
 | 接口 | 地址 | 说明 |
 | :--- | :--- | :--- |
-| 异动列表 (JSON) | `https://bot2.1230sb.com/api/data` | 返回活跃+已退出的完整数据 |
-| 异动列表 (纯列表) | `https://bot2.1230sb.com/api/list` | 仅返回当前活跃交易对 |
-| 动态交易对 | `http://127.0.0.1:3001/api/pairlist` | Freqtrade RemotePairList 数据源（内网） |
+| 异动列表 (JSON) | `https://bot2.1230sb.com/api/data` | 返回当前活跃 + 已退出历史的展示数据 |
+| 异动列表 (策略用) | `https://bot2.1230sb.com/api/list` | 返回最近 60 分钟进入且仍活跃的交易对及趋势数据 |
+| 动态交易对 | `http://127.0.0.1:3001/api/pairlist` | Freqtrade RemotePairList 数据源（内网），返回所有当前活跃交易对，格式为 `PAIR/USDT:USDT` |
 | Freqtrade API | `http://43.165.167.132:8000/api/v1` | Freqtrade 控制 API |
 | WebSocket | `ws://43.165.167.132:8000/api/v1/message/ws` | 实时推送 |
 
@@ -99,9 +99,25 @@ screen -wipe
 | :--- | :--- |
 | 部署目录 | `/www/wwwroot/volume_screener` |
 | 启动脚本 | `tv_binance_volume_screener.py` |
-| 运行方式 | `python3 tv_binance_volume_screener.py` |
+| 运行方式 | `screen -dmS screener venv/bin/python3 tv_binance_volume_screener.py` |
 | Python 虚拟环境 | `/www/wwwroot/volume_screener/venv` |
-| 日志文件 | `/www/wwwroot/volume_screener/volume_screener.log` |
+| 监听地址 | `127.0.0.1:3001`（仅本机，公网通过 Nginx 域名访问） |
+
+### 扫描程序重启
+
+```bash
+cd /www/wwwroot/volume_screener
+
+# 停止旧的 screener 会话（如果存在）
+screen -S screener -X quit 2>/dev/null
+
+# 后台启动扫描程序
+screen -dmS screener venv/bin/python3 tv_binance_volume_screener.py
+
+# 查看进程与监听端口
+ps aux | grep tv_binance | grep -v grep
+ss -tlnp | grep 3001
+```
 
 ### Freqtrade UI 登录凭据
 
@@ -345,16 +361,48 @@ elif pair.endswith("/USDC"):
 
 **说明**：AgeFilter 不使用交易所 API 的 `onboardDate` 字段，而是下载 1d 日线 K 线，统计多少根日线来判断上市天数。若某个交易对日线数据下载失败，该交易对会被移除。
 
-### 问题4：扫描程序 HTTP 服务 socket 泄漏导致无法连接
+### 问题4：扫描程序 HTTP 服务阻塞 / socket 泄漏导致无法连接
 
-**症状**：进程在运行，但 HTTP 端口 3001 无法建立新连接，`ss -tnp` 显示大量 `CLOSE-WAIT` 状态的连接。
+**症状**：进程在运行，但 HTTP 端口 3001 无法建立新连接，`ss -tnp` 显示大量 `CLOSE-WAIT` 状态的连接，或线程卡在 `tcp_recvmsg` 等待客户端数据。
 
-**原因**：`BaseHTTPRequestHandler` 默认开启 HTTP/1.1 keep-alive，客户端断开后服务端 socket 未正确关闭，运行数天后积累大量 CLOSE-WAIT 连接，Recv-Q 堆积，导致新连接无法被接受。
+**原因**：单线程 `HTTPServer` 容易被半开连接阻塞；同时 `BaseHTTPRequestHandler` 的 keep-alive 行为会让客户端断开后的 socket 长时间滞留，运行数天后可能积累 CLOSE-WAIT 连接，导致新请求无法被接受。
 
-**修复**：在 `VolumeSurgeHandler` 类中添加 `close_connection = True`，强制每次请求后立即关闭 TCP 连接。
+**修复**：
+
+- 使用 `ThreadingHTTPServer`，单个异常连接不阻塞其他请求
+- `VolumeSurgeHandler.close_connection = True`，每次请求后主动关闭连接
+- 在 `setup()` 中设置 `HTTP_REQUEST_TIMEOUT = 10` 秒，避免半开连接长时间占用线程
+- 监听地址改为 `127.0.0.1:3001`，公网只通过 Nginx 域名反代访问
 
 ```python
+HTTP_HOST = "127.0.0.1"
+HTTP_REQUEST_TIMEOUT = 10
+
 class VolumeSurgeHandler(BaseHTTPRequestHandler):
-    close_connection = True  # 关闭 keep-alive，防止 socket 泄漏
-    ...
+  close_connection = True
+
+  def setup(self):
+    self.request.settimeout(HTTP_REQUEST_TIMEOUT)
+    super().setup()
+
+server = ThreadingHTTPServer((HTTP_HOST, HTTP_PORT), VolumeSurgeHandler)
 ```
+
+### 问题5：`/api/data` 展示数据与 Freqtrade 活跃列表混用
+
+**症状**：`latest_exited_count` 有值，但页面 `results` 中没有退出交易对，前端无法显示退出记录；或者为了显示退出记录而影响 Freqtrade 白名单。
+
+**原因**：展示列表和交易列表都使用同一个 `_latest_scan`，语义混在一起。
+
+**修复**：拆成两个全局状态：
+
+- `_latest_scan`：页面展示数据，包含当前活跃 + 已退出历史
+- `_latest_active_scan`：交易接口数据，只包含当前仍满足 >500% 条件的活跃交易对
+
+接口分工：
+
+| 接口 | 数据范围 |
+| :--- | :--- |
+| `/api/data` | 当前活跃 + 已退出历史 |
+| `/api/list` | 最近 60 分钟进入且仍活跃的交易对 |
+| `/api/pairlist` | 所有当前活跃交易对，供 Freqtrade RemotePairList 使用 |
