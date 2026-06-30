@@ -1,6 +1,7 @@
 """
-TradingView 筛选器：定时获取币安永续合约中 24h 成交量涨跌 > 800% 的交易对
+TradingView 筛选器：定时获取币安永续合约中 24h 成交量涨跌 > 500% 的交易对
 每分钟更新一次，历史数据保存在 SQLite 数据库（最多保留 50 条）。
+包含 TV 技术评级 (Recommend.All / RSI) 及 1周/1月/3月涨幅。
 使用 TradingView Scanner API (非官方)
 """
 
@@ -16,7 +17,7 @@ from pathlib import Path
 import requests
 
 # ==================== 配置 ====================
-MIN_VOL_CHANGE_PCT = 800  # 24h 成交量变化最小百分比
+MIN_VOL_CHANGE_PCT = 500  # 24h 成交量变化最小百分比
 MAX_RESULTS = 200  # 最大结果数
 INTERVAL_SECONDS = 60  # 更新间隔（秒），60 = 1分钟
 DB_PATH = Path(__file__).parent / "data" / "volume_surge.db"
@@ -49,6 +50,10 @@ _scan_lock = threading.Lock()
 
 # 上一次扫描的交易对名称集合，用于检测退出
 _previous_scan_symbols: set[str] = set()
+# 上一轮各交易对的成交量变化值，用于检测"上穿"
+_prev_vol_change: dict[str, float] = {}
+# 当前活跃的交易对（已上穿且尚未下穿）
+_active_symbols: set[str] = set()
 
 # 交易对进入/退出时间记录
 _symbol_entry_time: dict[str, str] = {}  # name -> 首次进入时间
@@ -58,30 +63,18 @@ _symbol_exit_time: dict[str, str] = {}  # name -> 退出时间
 class VolumeSurgeHandler(BaseHTTPRequestHandler):
     """HTTP 请求处理器：显示最新的扫描结果。"""
 
-    def do_GET(self):
-        # 解析查询参数
-        parsed = self.path.split("?", 1)
-        path = parsed[0]
-        params = {}
-        if len(parsed) > 1:
-            for kv in parsed[1].split("&"):
-                if "=" in kv:
-                    k, v = kv.split("=", 1)
-                    params[k] = v
-                else:
-                    params[kv] = ""
+    # 关闭 HTTP keep-alive，防止 socket 泄漏（CLOSE-WAIT）
+    close_connection = True
 
-        if path == "/api/data":
+    def do_GET(self):
+        if self.path == "/api/data":
             self._serve_json()
-        elif path == "/api/list":
-            self._serve_json_list(params)
-        elif path == "/api/pairlist":
+        elif self.path == "/api/list":
+            self._serve_list()
+        elif self.path == "/api/pairlist":
             self._serve_pairlist()
-        elif path == "/" or path == "/index.html":
-            if params.get("format") == "json":
-                self._serve_json()
-            else:
-                self._serve_html()
+        elif self.path == "/" or self.path == "/index.html":
+            self._serve_html()
         else:
             self.send_response(404)
             self.end_headers()
@@ -95,6 +88,25 @@ class VolumeSurgeHandler(BaseHTTPRequestHandler):
                 item = dict(r)
                 item["entry_time"] = _symbol_entry_time.get(r["name"], "")
                 item["exit_time"] = _symbol_exit_time.get(r["name"], "")
+                # 技术评级: 数值转文字
+                rec = r.get("recommend_all")
+                if rec is not None:
+                    if rec > 0.5:
+                        item["rating_text"] = "🟢强烈买入"
+                    elif rec > 0.2:
+                        item["rating_text"] = "🟢买入"
+                    elif rec > 0:
+                        item["rating_text"] = "🟢偏多"
+                    elif rec == 0:
+                        item["rating_text"] = "⚪中性"
+                    elif rec > -0.2:
+                        item["rating_text"] = "🔴偏空"
+                    elif rec > -0.5:
+                        item["rating_text"] = "🔴卖出"
+                    else:
+                        item["rating_text"] = "🔴强烈卖出"
+                else:
+                    item["rating_text"] = ""
                 enriched.append(item)
             data = {
                 "timestamp": _latest_timestamp,
@@ -115,63 +127,53 @@ class VolumeSurgeHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _serve_html(self):
+        body = self._build_html().encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     @staticmethod
-    def _to_freqtrade_pair(name: str) -> str:
-        """将 TradingView 格式的交易对转为 freqtrade 格式，如 RIFUSDT.P -> RIF/USDT"""
-        # 去掉 .P / .PERP 后缀
-        for suffix in (".P", ".PERP"):
-            if name.endswith(suffix):
-                name = name[: -len(suffix)]
-                break
-        # 在稳定币前加 / 分隔
-        for quote in ("USDT", "USDC", "BUSD", "DAI", "FDUSD"):
+    def _tv_to_pair(raw: str) -> str:
+        """转换 TradingView 名称 "SAFEUSDT.P" → "SAFE/USDT" """
+        name = raw.replace(".P", "")
+        for quote in ("USDT", "USDC", "BUSD"):
             if name.endswith(quote) and len(name) > len(quote):
-                base = name[: -len(quote)]
-                return f"{base}/{quote}"
-        return name
+                return f"{name[: -len(quote)]}/{quote}"
+        return f"{name}/USDT"
 
-    def _serve_json_list(self, params):
-        """返回精简的最新列表 JSON，支持参数:
-        type: all(默认), new, exited
-        format: pair(仅返回交易对列表，freqtrade 格式)
+    def _serve_list(self):
         """
-        list_type = params.get("type", "all")
-        fmt = params.get("format", "full")
+        /api/list — 仅返回最近1小时内进入的交易对及趋势数据，供 Freqtrade 策略使用。
+        返回格式: [{"pair": "SAFE/USDT", "perf_1w": -10.87, ...}]
+        """
+        one_min_ago = (datetime.now() - timedelta(minutes=1)).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
         with _scan_lock:
-            if list_type == "new":
-                items = [r for r in _latest_scan if r["name"] in _latest_new_symbols]
-            elif list_type == "exited":
-                items = [r for r in _latest_scan if r["name"] in _latest_exited_symbols]
-            else:
-                items = _latest_scan[:]
-
-            if fmt == "pair":
-                # 仅返回 freqtrade 格式的交易对列表
-                pairs = [self._to_freqtrade_pair(r["name"]) for r in items]
-                body = json.dumps(pairs, ensure_ascii=False).encode("utf-8")
-            else:
-                result = []
-                for r in items:
-                    result.append(
-                        {
-                            "name": r["name"],
-                            "price": r.get("price"),
-                            "vol_change_24h_pct": r.get("vol_change_24h_pct"),
-                            "vol_24h": r.get("vol_24h"),
-                            "price_change_24h_pct": r.get("price_change_24h_pct"),
-                            "entry_time": _symbol_entry_time.get(r["name"], ""),
-                            "exit_time": _symbol_exit_time.get(r["name"], ""),
-                        }
-                    )
-
-                data = {
-                    "timestamp": _latest_timestamp,
-                    "type": list_type,
-                    "total": len(items),
-                    "results": result,
-                }
-                body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
-
+            results = []
+            for r in _latest_scan:
+                name = r.get("name", "")
+                entry = _symbol_entry_time.get(name, "")
+                if not entry or entry < one_min_ago:
+                    continue  # 仅返回最近1分钟内进入的交易对给Freqtrade
+                pair = self._tv_to_pair(name)
+                results.append(
+                    {
+                        "pair": pair,
+                        "price": r.get("price"),
+                        "vol_24h": r.get("vol_24h"),
+                        "vol_change_24h_pct": r.get("vol_change_24h_pct"),
+                        "perf_1w": r.get("perf_1w"),
+                        "perf_1m": r.get("perf_1m"),
+                        "perf_3m": r.get("perf_3m"),
+                        "recommend_all": r.get("recommend_all"),
+                        "rsi": r.get("rsi"),
+                    }
+                )
+        body = json.dumps(results, ensure_ascii=False, default=str).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -180,53 +182,40 @@ class VolumeSurgeHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _serve_pairlist(self):
-        """为 Freqtrade RemotePairList 插件提供交易对列表（仅30分钟内新增的）"""
-        pairs = self._to_freqtrade_pair_list(minutes=30)
-        data = {"pairs": pairs, "refresh_period": 1800}
-        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        """
+        /api/pairlist — 仅返回最近1小时内进入的交易对（按成交量降序），供 Freqtrade RemotePairList 使用。
+        Binance 合约 (swap) 格式需要 ":USDT" 后缀才能被 expand_pairlist 匹配。
+        返回格式: {"pairs": ["SAFE/USDT:USDT", "ME/USDT:USDT", ...], "refresh_period": 60}
+        """
+        one_min_ago = (datetime.now() - timedelta(minutes=1)).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        with _scan_lock:
+            items = []
+            for r in _latest_scan:
+                name = r.get("name", "")
+                entry = _symbol_entry_time.get(name, "")
+                if not entry or entry < one_min_ago:
+                    continue  # 仅返回最近1分钟内进入的交易对给Freqtrade
+                pair = self._tv_to_pair(name)
+                # Binance 合约格式: expand_pairlist 需带 :USDT 后缀才能匹配
+                if pair.endswith("/USDT"):
+                    pair = f"{pair}:USDT"
+                elif pair.endswith("/USDC"):
+                    pair = f"{pair}:USDC"
+                vol = r.get("vol_24h")
+                if vol is None or vol == "":
+                    vol = 0
+                items.append((pair, float(vol)))
+            # 按成交量降序排序
+            items.sort(key=lambda x: x[1], reverse=True)
+            pairlist = [p[0] for p in items]
+        result = {"pairs": pairlist, "refresh_period": INTERVAL_SECONDS}
+        body = json.dumps(result, ensure_ascii=False, default=str).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Access-Control-Allow-Origin", "*")
-        self.end_headers()
-        self.wfile.write(body)
-
-    @staticmethod
-    def _to_freqtrade_pair_list(minutes: int = 0) -> list:
-        """将当前异动列表转为 Freqtrade 永续合约格式。
-        如果 minutes>0，仅返回最近 minutes 分钟内进入列表的交易对。
-        """
-        cut = ""
-        if minutes > 0:
-            cut = (datetime.now() - timedelta(minutes=minutes)).strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
-        with _scan_lock:
-            result = []
-            for r in _latest_scan:
-                name = r.get("name", "")
-                # 过滤: 只保留指定时间内进入的
-                if cut:
-                    entry = _symbol_entry_time.get(name, "")
-                    if not entry or entry < cut:
-                        continue
-                # RIFUSDT.P -> RIF/USDT:USDT
-                for suffix in (".P", ".PERP"):
-                    if name.endswith(suffix):
-                        name = name[: -len(suffix)]
-                        break
-                for quote in ("USDT", "USDC", "BUSD", "FDUSD"):
-                    if name.endswith(quote) and len(name) > len(quote):
-                        base = name[: -len(quote)]
-                        result.append(f"{base}/{quote}:{quote}")
-                        break
-            return result
-
-    def _serve_html(self):
-        body = self._build_html().encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
@@ -326,44 +315,57 @@ tr.row-exited:hover td { background: linear-gradient(135deg,
                 <th>24h量变化</th>
                 <th>24h成交量</th>
                 <th>24h价变化</th>
+                <th>1周涨幅</th>
+                <th>1月涨幅</th>
+                <th>3月涨幅</th>
+                <th>技术评级</th>
+                <th>RSI</th>
                 <th>进入/退出时间</th>
             </tr>
         </thead>
-        <tbody id="table-body"><tr><td colspan="7" style="text-align:center;padding:40px;color:#6a7a8a">加载中...</td></tr></tbody>
+        <tbody id="table-body"><tr><td colspan="12" style="text-align:center;padding:40px;color:#6a7a8a">加载中...</td></tr></tbody>
     </table>
     <div class="footer" id="footer">
-        条件: 24h成交量变化 &gt; 800% &nbsp;|&nbsp; 更新间隔: 60s &nbsp;|&nbsp; 🟢 绿色竖条=1小时内新增 &nbsp;|&nbsp; 🟠 橙色竖条=已退出
+        条件: 24h成交量变化 &gt; 500% &nbsp;|&nbsp; 更新间隔: 60s &nbsp;|&nbsp; 🟢 绿色竖条=1小时内新增 &nbsp;|&nbsp; 🟠 橙色竖条=已退出
+        &nbsp;|&nbsp; <a href="javascript:void(0)" id="notif-btn" onclick="enableNotifications()" style="color:#f0b90b;text-decoration:none;font-weight:600">🔔 开启桌面通知</a>
     </div>
 </div>
 <script>
 const MAX = 30;
-// 浏览器通知：已通知过的交易对集合，避免重复弹窗
-let _notifiedNew = new Set();
-
-// 请求通知权限
-if ('Notification' in window && Notification.permission === 'default') {
-    Notification.requestPermission();
-}
-
-function sendNewPairNotification(symbol, volChange, priceChange) {
-    if (!('Notification' in window) || Notification.permission !== 'granted') return;
-    if (_notifiedNew.has(symbol)) return;
-    _notifiedNew.add(symbol);
-
-    try {
-        const n = new Notification('📈 成交量异动 · 新交易对', {
-            body: symbol + '\\n24h量变化: ' + volChange + '\\n24h价变化: ' + priceChange,
-            icon: 'data:image/svg+xml,' + encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y=".9em" font-size="80">📊</text></svg>'),
-            tag: 'vol-surge-' + symbol,
-            requireInteraction: true
-        });
-        // 点击通知跳转到页面
-        n.onclick = function () { window.focus(); this.close(); };
-        // 5秒后自动关闭
-        setTimeout(() => n.close(), 5000);
-    } catch (e) {
-        // 静默失败
+// 浏览器桌面通知（须用户点击触发）
+let _notified = new Set();
+function enableNotifications() {
+    if (!('Notification' in window)) { alert('当前浏览器不支持桌面通知'); return; }
+    if (Notification.permission === 'granted') {
+        new Notification('✅ 通知已开启', { body: '有新异动交易对时会收到通知' });
+        document.getElementById('notif-btn').textContent = '🔔 通知已开启';
+        document.getElementById('notif-btn').style.cursor = 'default';
+        return;
     }
+    if (Notification.permission === 'denied') {
+        alert('通知已被拒绝，请在浏览器站点设置中重新允许通知');
+        return;
+    }
+    Notification.requestPermission().then(function(p) {
+        if (p === 'granted') {
+            new Notification('✅ 通知已开启', { body: '有新异动交易对时会收到通知' });
+            document.getElementById('notif-btn').textContent = '🔔 通知已开启';
+            document.getElementById('notif-btn').style.cursor = 'default';
+        } else {
+            alert('通知被拒绝，可在浏览器设置中重新开启');
+        }
+    });
+}
+function notifyNewPairs(symbols) {
+    if (!('Notification' in window) || Notification.permission !== 'granted') return;
+    const fresh = symbols.filter(s => !_notified.has(s));
+    if (fresh.length === 0) return;
+    fresh.forEach(s => _notified.add(s));
+    const title = fresh.length === 1 ? '🆕 新异动交易对' : '🆕 新异动交易对 ×' + fresh.length;
+    const body = fresh.length <= 5
+        ? fresh.join(', ')
+        : fresh.slice(0, 5).join(', ') + ' … 等' + fresh.length + '个';
+    try { new Notification(title, { body }); } catch {}
 }
 
 function fmt(n) { try { return Number(n).toLocaleString(); } catch { return '-'; } }
@@ -379,27 +381,9 @@ async function fetchData() {
         if (!r.ok) throw new Error('HTTP ' + r.status);
         const d = await r.json();
         render(d);
-        // 检查新交易对并发送通知
-        checkNewSymbols(d);
     } catch(e) {
         document.getElementById('table-body').innerHTML =
             '<tr><td colspan="7" style="text-align:center;padding:40px;color:#ff6b6b;font-size:16px">\u26a0\ufe0f ' + e.message + '</td></tr>';
-    }
-}
-
-function checkNewSymbols(d) {
-    const newSymbols = d.latest_new_symbols || [];
-    if (newSymbols.length === 0) return;
-
-    // 构建一个 name -> result 的映射
-    const resultMap = {};
-    (d.results || []).forEach(r => { resultMap[r.name] = r; });
-
-    for (const sym of newSymbols) {
-        const r = resultMap[sym];
-        const volChg = r ? fmt1(r.vol_change_24h_pct) : '-';
-        const priceChg = r ? fmt2(r.price_change_24h_pct) : '-';
-        sendNewPairNotification(sym, volChg, priceChg);
     }
 }
 
@@ -414,6 +398,11 @@ function render(d) {
     extEl.textContent = d.latest_exited_count;
     extEl.className = 'value' + (d.latest_exited_count > 0 ? ' exited' : '');
     document.getElementById('stat-hist').textContent = d.history_total;
+
+    // 浏览器通知：新出现的交易对
+    if (d.latest_new_symbols && d.latest_new_symbols.length > 0) {
+        notifyNewPairs(d.latest_new_symbols);
+    }
 
     // 表
     const results = d.results || [];
@@ -436,6 +425,22 @@ function render(d) {
         const vol = fmt(r.vol_24h);
         const priceChg = fmt2(r.price_change_24h_pct);
 
+        // 技术评级
+        const rating = r.rating_text || '-';
+        const rsiVal = r.rsi != null ? Number(r.rsi).toFixed(1) : '-';
+
+        // 表现
+        function fmtPerf(v) {
+            if (v == null) return '-';
+            const n = Number(v);
+            const s = n.toFixed(2) + '%';
+            return n >= 0 ? '<span style="color:#2ecc71">+' + s + '</span>'
+                         : '<span style="color:#ff6b6b">' + s + '</span>';
+        }
+        const perf1w = fmtPerf(r.perf_1w);
+        const perf1m = fmtPerf(r.perf_1m);
+        const perf3m = fmtPerf(r.perf_3m);
+
         let timeLabel, timeClass;
         if (isExt) {
             timeLabel = r.exit_time || '-';
@@ -452,6 +457,11 @@ function render(d) {
             '<td class="vol-change">' + volChg + '</td>' +
             '<td>' + vol + '</td>' +
             '<td>' + priceChg + '</td>' +
+            '<td style="font-size:12px">' + perf1w + '</td>' +
+            '<td style="font-size:12px">' + perf1m + '</td>' +
+            '<td style="font-size:12px">' + perf3m + '</td>' +
+            '<td style="font-size:12px">' + rating + '</td>' +
+            '<td>' + rsiVal + '</td>' +
             '<td class="' + timeClass + '">' + timeLabel + '</td>' +
             '</tr>';
     }
@@ -504,6 +514,13 @@ def get_binance_perpetual_volume_surge(
             "24h_vol|5",
             "24h_close_change|5",
             "currency",
+            "Recommend.All|5",
+            "Recommend.MA|5",
+            "Recommend.Other|5",
+            "RSI|5",
+            "Perf.W",
+            "Perf.1M",
+            "Perf.3M",
         ],
         "filter2": {
             "operator": "and",
@@ -521,6 +538,13 @@ def get_binance_perpetual_volume_surge(
                         "left": "exchange",
                         "operation": "equal",
                         "right": "BINANCE",
+                    }
+                },
+                {
+                    "expression": {
+                        "left": "currency",
+                        "operation": "equal",
+                        "right": "USDT",
                     }
                 },
                 {
@@ -556,6 +580,13 @@ def get_binance_perpetual_volume_surge(
                 "vol_24h": d[5],
                 "price_change_24h_pct": d[6] if len(d) > 6 else None,
                 "currency": d[7] if len(d) > 7 else None,
+                "recommend_all": d[8] if len(d) > 8 else None,
+                "recommend_ma": d[9] if len(d) > 9 else None,
+                "recommend_other": d[10] if len(d) > 10 else None,
+                "rsi": d[11] if len(d) > 11 else None,
+                "perf_1w": d[12] if len(d) > 12 else None,
+                "perf_1m": d[13] if len(d) > 13 else None,
+                "perf_3m": d[14] if len(d) > 14 else None,
             }
         )
     return results
@@ -787,17 +818,27 @@ def main_loop():
         try:
             results = get_binance_perpetual_volume_surge()
             current_names = {r["name"] for r in results}
+            name_to_data = {r["name"]: r for r in results}
 
-            # 检测本轮退出并写入DB
+            # ── 所有 >500% 的交易对都视为活跃 ──
+            _active_symbols = set(current_names)
+
+            # ── 检测退出并写入DB ──
             newly_exited = set()
             if _previous_scan_symbols:
                 newly_exited = _previous_scan_symbols - current_names
                 for en in newly_exited:
                     update_exit_in_db(en, timestamp)
-            _previous_scan_symbols = current_names
+                    _active_symbols.discard(en)
+            _previous_scan_symbols = set(current_names)
+
+            # ── 构建活跃交易对数据列表 ──
+            active_data = []
+            for name in current_names:
+                active_data.append(name_to_data[name])
 
             # 保存新增到DB
-            save_to_db(results, timestamp)
+            save_to_db(active_data, timestamp)
 
             # ---- NEW 标记：1小时内进入的 ----
             one_hour_ago = (datetime.now() - timedelta(hours=1)).strftime(
@@ -805,7 +846,7 @@ def main_loop():
             )
             new_names_set = {
                 r["name"]
-                for r in results
+                for r in active_data
                 if _symbol_entry_time.get(r["name"], "") >= one_hour_ago
             }
 
@@ -813,7 +854,7 @@ def main_loop():
             exited_names_set = set(_symbol_exit_time.keys())
 
             # ---- 从DB获取已退出交易对，追加到显示列表 ----
-            all_display = list(results)
+            all_display = list(active_data)
             conn = get_db()
             exited_rows = conn.execute(
                 "SELECT name, symbol, exit_time FROM symbols WHERE exit_time IS NOT NULL ORDER BY exit_time DESC"
@@ -821,9 +862,7 @@ def main_loop():
             conn.close()
             for row in exited_rows:
                 name = row["name"]
-                if name not in current_names and name not in {
-                    r["name"] for r in all_display
-                }:
+                if name not in set(r["name"] for r in all_display):
                     all_display.append(
                         {
                             "name": name,
@@ -835,10 +874,17 @@ def main_loop():
                             "vol_24h": "",
                             "price_change_24h_pct": "",
                             "currency": "",
+                            "recommend_all": None,
+                            "recommend_ma": None,
+                            "recommend_other": None,
+                            "rsi": None,
+                            "perf_1w": None,
+                            "perf_1m": None,
+                            "perf_3m": None,
                         }
                     )
 
-            # 排序：进入的在上（按进入时间降序），退出的在下（按退出时间降序）
+            # 排序：进入的在上，退出的在下
             all_display = sort_by_status_and_time(all_display, exited_names_set)
 
             print_results(
@@ -852,7 +898,8 @@ def main_loop():
 
             # 更新 HTTP 全局状态
             with _scan_lock:
-                _latest_scan = all_display
+                # _latest_scan 仅保留当前活跃（>500%）的交易对
+                _latest_scan = list(active_data)
                 _latest_timestamp = timestamp
                 _latest_new_symbols = new_names_set
                 _latest_exited_symbols = exited_names_set
