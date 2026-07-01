@@ -4,7 +4,7 @@
 基于成交量异动监控 API 的 Freqtrade 多空策略。
 
 核心逻辑：
-  1. 轮询 43.165.167.132:3001 获取 24h 成交量暴涨 >500% 的币安永续合约交易对
+    1. 轮询 127.0.0.1:3001 获取 24h 成交量暴涨 >500% 的币安永续合约交易对
   2. 【方向逻辑由用户手工定义】
   3. 使用账户总余额 10% 保证金、10 倍杠杆市价开仓
   4. 移动止盈（做多带硬止损）
@@ -54,7 +54,7 @@ class VolumeSurgeShortStrategy(IStrategy):
     stake_amount = "unlimited"
 
     # ── 参数（可通过 Freqtrade 配置覆盖） ──
-    surge_api_url = "http://43.165.167.132:3001/api/list"
+    surge_api_url = "http://127.0.0.1:3001/api/list"
     stake_balance_pct = 0.05  # 账户总余额 5% 作为单笔保证金
     fallback_amount = 100
     stoploss_price_pct = 0.30  # 做多硬止损
