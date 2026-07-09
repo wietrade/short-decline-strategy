@@ -1,408 +1,245 @@
-# 成交量异动多空策略 — Freqtrade 模拟交易
+# 成交量异动做空策略 — TradingView Scanner + Freqtrade
 
-## 服务器信息
+## 架构总览
+
+```text
+TradingView Scanner API（非官方）
+        │ 每 60 秒轮询
+        ▼
+tv_binance_volume_screener.py  ── 本机 :3001 ──┬── /api/pairlist ──► Freqtrade RemotePairList（选币）
+        │                                       ├── /api/list     ──► ShortDeclineStrategy（数据源：perf/24h）
+        │                                       ├── /api/data     ──► HTML 看板（含已退出历史）
+        │                                       └── /             ──► 监控页面
+        │
+        ▼
+strategy_short_decline.py  ── Freqtrade 纯做空 DCA 策略（ShortDeclineStrategy）
+```
+
+---
+
+## 程序说明
+
+### 1. 扫描程序 `tv_binance_volume_screener.py`
+
+每 60 秒调用 TradingView Scanner API，筛选 **币安 USDT 永续合约** 中 **24h 成交量变化 > 500%** 的交易对。
+
+| 特性 | 说明 |
+| :--- | :--- |
+| 活跃窗口 | 交易对首次出现后保留 **30 分钟**（`ACTIVE_DURATION_MINUTES`），超时移出 pairlist |
+| 重新激活 | 退出后再次满足条件，`entry_time` 重置，重新获得 30 分钟窗口 |
+| 数据清洗 | 数值字段经 `_to_float_or_none()` 处理 → `float \| null` |
+| 历史记录 | SQLite（`data/volume_surge.db`），最多保留 50 条 |
+| HTTP 健壮性 | `ThreadingHTTPServer` + `close_connection=True` + 10s 超时，防 socket 泄漏 |
+| 优雅退出 | 捕获 SIGINT/SIGTERM，`_running=False` 后关闭 HTTP 服务 |
+| 运行方式 | 服务器上用 screen 守护 |
+
+### 2. 策略 `strategy_short_decline.py`（ShortDeclineStrategy）
+
+**纯做空 + DCA 金字塔加仓策略**，针对长期下跌、短期异动爆拉的山寨币。
+
+| 环节 | 逻辑 |
+| :--- | :--- |
+| 数据源 | 每 60 秒轮询 `http://127.0.0.1:3001/api/list`，缓存 perf 与 24h 涨跌幅 |
+| 入场排除 | ① 24h 跌幅 > 10% 不做空；② `perf_1w/1m/3m − 24h涨幅` 任一 > 0 不做空 |
+| 数据缺失保护 | 任一字段缺失（perf 或 24h）则该交易对不交易 |
+| 入场方向 | 通过筛选 → 做空（`enter_short`，tag=`short_decline`） |
+| ADX 排序 | 首次开仓按 ADX(14) 从高到低排队，只有候选中最高 ADX 才放行 |
+| 开仓 | 50U 保证金 × 10x 杠杆 = 500U 名义；记录首仓价与币数量 |
+| DCA 加仓 | 逆势上涨触发，间隔按斐波那契数列递增，币数量与首仓相同，最多 5 次 |
+| 出场 | 基于加权持仓均价 `trade.open_rate` 做移动止盈，并按 15m ATR% 波动率动态调整激活/反弹参数 |
+| 止损 | `custom_stoploss` 返回 -10.0（1000%），等效不止损 |
+
+**出场逻辑关键点**：`use_exit_signal = True` 是 `custom_exit` 被调用的**前提**。Freqtrade 源码中 `custom_exit` 的调用被包在 `if self.use_exit_signal:` 内，若设为 `False` 则出场逻辑完全失效（会导致盈利单永不平仓）。`populate_exit_trend` 不设任何信号，所有出场都在 `custom_exit` 中完成。
+
+**重启健壮性**：首仓价和币数量优先从 `trade.orders` 的真实成交入场订单恢复（`_get_first_entry_state`），内存缓存丢失（重启）也能正确管理已有持仓。
+
+### DCA 加仓间隔（斐波那契递增）
+
+间隔按斐波那契数列递增，前期密集拉平成本、后期拉宽保留弹药（`_dca_trigger_rise`）：
+
+```text
+gap_i     = short_add_threshold(10%) × fib(i)   # fib = 1,1,2,3,5
+trigger(n) = Σ gap_i (i=1..n)
+```
+
+| 第几次加仓 | fib | 单步间隔 | 累计触发涨幅 |
+| :---: | :---: | :---: | :---: |
+| 1 | 1 | +10% | **+10%** |
+| 2 | 1 | +10% | **+20%** |
+| 3 | 2 | +20% | **+40%** |
+| 4 | 3 | +30% | **+70%** |
+| 5 | 5 | +50% | **+120%** |
+
+### 移动止盈（波动率动态参数）
+
+移动止盈从加权持仓均价 `trade.open_rate` 开始计算，而不是首仓价。策略记录持仓期间最低价；当价格先向盈利方向跌破激活阈值，再从最低点反弹达到回撤阈值时平仓。
+
+平仓还有一道硬条件：当前必须仍是盈利状态。也就是空单当前价仍低于加权持仓均价，且 Freqtrade 传入的 `current_profit > 0`。如果价格已经反弹到均价上方，即使历史最低价曾经触发过移动止盈激活，也不会按止盈原因平仓。
+
+波动率使用最近 20 根 15m K 线的 ATR%：
+
+```text
+volatility = ATR(20) / close
+```
+
+| 波动率分档 | ATR% 条件 | 激活移动止盈 | 从最低点反弹平仓 |
+| :--- | :---: | :---: | :---: |
+| 低波动 | < 2% | 盈利 4% | 反弹 2% |
+| 中波动 | 2% ~ 5% | 盈利 6% | 反弹 3% |
+| 高波动 | ≥ 5% | 盈利 10% | 反弹 5% |
+
+这样低波动币会更早锁住利润；高波动币给更大的正常回抽空间，避免刚启动趋势就被噪音洗出。
+
+---
+
+## DCA 如何改善做空均价
+
+做空 DCA 在**更高价位**继续加空，会把加权空单均价抬高。后续移动止盈以 `trade.open_rate` 这个加权持仓均价为盈利起算点，而不是以首仓价为准：
+
+| 仓位 | 开空价 | 平仓价（回首仓） | 盈亏 |
+| :--- | :---: | :---: | :---: |
+| 首仓 | 100 | 100 | 0 |
+| 加仓1 | 110 | 100 | +10 |
+| 加仓2 | 120 | 100 | +20 |
+
+这个例子只说明 DCA 后均价会改善：价格即使只回到首仓附近，加仓部分也已有利润。当前真实出场不再固定等“回到首仓价”，而是等价格先低于加权均价达到动态激活阈值，再从持仓最低点反弹达到动态阈值后平仓。
+
+---
+
+## 服务器
 
 | 项目 | 值 |
 | :--- | :--- |
-| IP 地址 | `43.165.167.132` |
-| SSH 密钥 | `43.165.167.132_id_ed25519` |
-| SSH 用户 | `root` |
-| SSH 连接 | `ssh -i "43.165.167.132_id_ed25519" root@43.165.167.132` |
+| IP | `43.165.167.132` |
+| SSH | `ssh -i "43.165.167.132_id_ed25519" root@43.165.167.132` |
+| 公网入口 | [https://bot2.1230sb.com](https://bot2.1230sb.com)（Nginx 反代 `127.0.0.1:3001`） |
+| 策略路径 | `/www/wwwroot/freqtrade/user_data/strategies/strategy_short_decline.py` |
+| 配置路径 | `/www/wwwroot/freqtrade/user_data/config_trade_surge.json` |
+| 交易数据库 | `/www/wwwroot/freqtrade/tradesv3.dryrun.sqlite` |
 
----
-
-## Freqtrade 部署
-
-| 项目 | 路径 |
-| :--- | :--- |
-| 安装目录 | `/www/wwwroot/freqtrade` |
-| Python 虚拟环境 | `/www/wwwroot/freqtrade/.venv` |
-| Python 版本 | 3.12（虚拟环境 `.venv`） |
-| 运行方式 | `screen -S freqtrade` 后台守护 |
-| 启动命令 | `cd /www/wwwroot/freqtrade && screen -dmS freqtrade bash -c '.venv/bin/freqtrade trade --strategy VolumeSurgeShortStrategy --userdir user_data -c user_data/config_trade_surge.json'` |
-
-### Screen 会话管理
-
-```bash
-# 创建新会话（后台启动 Freqtrade）
-screen -dmS freqtrade bash -c \
-  '.venv/bin/freqtrade trade \
-    --strategy VolumeSurgeShortStrategy \
-    --userdir user_data \
-    -c user_data/config_trade_surge.json'
-
-# 列出所有 screen 会话
-screen -ls
-
-# 附加到 freqtrade 会话（查看实时日志）
-screen -r freqtrade
-
-# 分离会话（不中断运行）：Ctrl+A, D
-
-# 终止 freqtrade 会话
-screen -S freqtrade -X quit
-
-# 清除已死亡的会话
-screen -wipe
-
-```
-
-### 策略文件
-
-| 文件 | 路径 |
-| :--- | :--- |
-| 策略 | `/www/wwwroot/freqtrade/user_data/strategies/strategy_volume_surge.py` |
-| 策略名称 | `VolumeSurgeShortStrategy` |
-
-### 配置文件
-
-| 文件 | 路径 |
-| :--- | :--- |
-| 交易配置 | `/www/wwwroot/freqtrade/user_data/config_trade_surge.json` |
-
-### 数据库
-
-| 文件 | 路径 |
-| :--- | :--- |
-| 模拟交易数据库 | `/www/wwwroot/freqtrade/tradesv3.dryrun.sqlite` |
-| 回测结果 | `/www/wwwroot/freqtrade/user_data/backtest_results/` |
-| 日志 | `/www/wwwroot/freqtrade/user_data/logs/` |
-
----
-
-## 服务端口
+### 端口
 
 | 服务 | 端口 | 说明 |
 | :--- | :---: | :--- |
-| **成交量异动 API** | `3001` | 提供 24h 成交量暴涨 >500% 的交易对列表（含活跃/退出标记） |
-| **Freqtrade UI** | `8000` | Freqtrade REST API 及 WebSocket 控制面板 |
+| 扫描程序 API | 3001 | HTTP（仅本机，Nginx 反代到公网） |
+| Freqtrade API | 8000 | REST API + WebSocket |
 
-### 域名访问
+---
 
-| 域名 | 说明 |
-| :--- | :--- |
-| [https://bot2.1230sb.com](https://bot2.1230sb.com) | 成交量异动监控 Web 界面（Nginx 反代 → 127.0.0.1:3001） |
+## API 接口
 
-### API 接口
+### `/api/pairlist` — RemotePairList 数据源
 
-| 接口 | 地址 | 说明 |
-| :--- | :--- | :--- |
-| 异动列表 (JSON) | `https://bot2.1230sb.com/api/data` | 返回当前活跃 + 已退出历史的展示数据 |
-| 异动列表 (策略用) | `https://bot2.1230sb.com/api/list` | 返回最近 60 分钟进入且仍活跃的交易对及趋势数据 |
-| 动态交易对 | `http://127.0.0.1:3001/api/pairlist` | Freqtrade RemotePairList 数据源（内网），返回所有当前活跃交易对，格式为 `PAIR/USDT:USDT` |
-| Freqtrade API | `http://43.165.167.132:8000/api/v1` | Freqtrade 控制 API |
-| WebSocket | `ws://43.165.167.132:8000/api/v1/message/ws` | 实时推送 |
+供 Freqtrade 配置引用，带 `:USDT` 后缀适配 Binance 合约 `expand_pairlist`。
 
-### 成交量异动 API 服务
+```json
+{"pairs": ["SAFE/USDT:USDT", "ME/USDT:USDT"], "refresh_period": 60}
+```
 
-| 项目 | 值 |
-| :--- | :--- |
-| 部署目录 | `/www/wwwroot/volume_screener` |
-| 启动脚本 | `tv_binance_volume_screener.py` |
-| 运行方式 | `screen -dmS screener venv/bin/python3 tv_binance_volume_screener.py` |
-| Python 虚拟环境 | `/www/wwwroot/volume_screener/venv` |
-| 监听地址 | `127.0.0.1:3001`（仅本机，公网通过 Nginx 域名访问） |
+仅含进入时间 ≤ 30 分钟的交易对，按 24h 成交量降序。
 
-### 扫描程序重启
+### `/api/list` — 策略数据源
+
+策略实际拉取的接口，返回当前活跃交易对的完整数值字段（含 `price_change_24h_pct`）。
+
+```json
+[{"pair": "SAFE/USDT", "price": 0.1234, "vol_change_24h_pct": 850.5,
+  "price_change_24h_pct": -3.2, "perf_1w": -10.87, "perf_1m": -25.3,
+  "perf_3m": -40.2, "recommend_all": -0.75, "rsi": 42.3}]
+```
+
+### `/api/data` — 完整数据（含已退出历史）
+
+含 `entry_time`/`exit_time`/`rating_text` 等字段，供浏览器渲染看板。
+
+---
+
+## 部署
+
+### 扫描程序（screen 守护）
 
 ```bash
 cd /www/wwwroot/volume_screener
-
-# 停止旧的 screener 会话（如果存在）
-screen -S screener -X quit 2>/dev/null
-
-# 后台启动扫描程序
 screen -dmS screener venv/bin/python3 tv_binance_volume_screener.py
 
-# 查看进程与监听端口
+# 管理
+screen -r screener            # 附加查看（Ctrl+A D 分离）
+screen -S screener -X quit    # 停止
 ps aux | grep tv_binance | grep -v grep
-ss -tlnp | grep 3001
 ```
 
-### Freqtrade UI 登录凭据
+### Freqtrade（setsid 脱离会话）
 
-| 项目 | 值 |
-| :--- | :--- |
-| 地址 | `http://43.165.167.132:8000` |
-| 用户名 | `admin` |
-| 密码 | `admin123` |
+```bash
+cd /www/wwwroot/freqtrade
+
+# 停止旧进程（交互式 SSH 中执行；不要嵌在同一条远程启动命令里）
+pkill -9 -f "[f]reqtrade trade"
+
+# 后台启动（setsid 确保脱离 SSH 会话，不随连接断开退出）
+setsid bash -c '.venv/bin/freqtrade trade \
+  --strategy ShortDeclineStrategy \
+  --userdir user_data \
+  -c user_data/config_trade_surge.json > /tmp/ft.log 2>&1' < /dev/null &
+
+# 管理
+pgrep -af "[f]reqtrade trade" # 查看进程
+tail -f /tmp/ft.log           # 查看日志
+```
+
+> ⚠️ 用 `nohup ... &` 直接跟在 SSH 命令后可能随会话退出被杀，务必用 `setsid`。
+> ⚠️ 在 Windows PowerShell 里把 `pkill -f "freqtrade trade"` 和启动命令塞进同一条 SSH 命令，可能误杀当前远程 shell。建议分步执行，或用 `[f]reqtrade trade` 这种不会自匹配的模式查看进程。
+> 更换策略或清空模拟盘时：`rm -f /www/wwwroot/freqtrade/tradesv3.dryrun.sqlite*`
 
 ---
 
-## 模拟交易参数
+## 配置 `config_trade_surge.json`
 
 | 参数 | 值 | 说明 |
-| :---: | :--- | :--- |
-| 模拟总资金 | `1000 USDT` | `dry_run_wallet` |
-| 单笔保证金 | 账户余额 5%（动态每日更新） | `stake_amount = unlimited`，由 `custom_stake_amount` 计算 |
-| 杠杆 | `10×` | 名义价值 1000 USDT |
-| 最大持仓 | `10` | `max_open_trades` |
-| 交易模式 | `futures` | 永续合约 |
-| 保证金模式 | `isolated` | 逐仓 |
+| :--- | :---: | :--- |
+| 模式 | dry_run | 模拟盘 |
+| 模拟资金 | 2000 USDT | `dry_run_wallet` |
+| 单笔保证金 | 50 USDT | 由策略 `custom_stake_amount` 控制 |
+| 杠杆 | 10x | `futures_leverage` |
+| 最大持仓 | 10 | `max_open_trades` |
+| 保证金模式 | cross | 全仓 |
+| 入场/退出价侧 | other | 吃对手盘 |
+| 交易对过滤 | 上市 ≥ 90 天 | RemotePairList + AgeFilter |
 
-### 风控规则
+### 扫描程序常量
 
-| 规则 | 条件 | 说明 |
-| :--- | :--- | :--- |
-| 移动止盈（多/空） | 价格朝有利方向波动 ≥ 5% 后激活，从极端价格回撤 4% 即平仓 | 锁定利润 |
-| 硬止损（仅做多） | 开仓价反向波动 30% 即止损 | 基于加权平均开仓价计算 |
-| 做空加仓 | 从首次开仓价每上涨 10% 加仓一次，最多 5 次 | 逆势加仓，无硬止损 |
+| 参数 | 默认值 | 说明 |
+| :--- | :---: | :--- |
+| `MIN_VOL_CHANGE_PCT` | 500 | 24h 成交量变化最小百分比 |
+| `INTERVAL_SECONDS` | 60 | 轮询间隔（秒） |
+| `ACTIVE_DURATION_MINUTES` | 30 | 交易对在 pairlist 中最长保留时间 |
+| `MAX_HISTORY_RECORDS` | 50 | 数据库最多保留记录数 |
 
 ---
 
-## TV 自选表管理器
-
-`tv_watchlist_manager.py` 可自动将成交量异动交易对添加到 TradingView 自选表。
-
-### 工作原理
-
-从 `tv_binance_volume_screener.py` 的 HTTP API 获取数据，通过 TV 内部 API 操作自选表。
-
-**活跃/退出机制：**
-
-- 扫描器每 60 秒查询 TV Scanner API，只返回 24h 成交量变化 > 500% 的交易对
-- 如果一个交易对之前 > 500%，但某次扫描掉到 < 500%，自动标记为「退出」并记录退出时间
-- 退出交易对仍在 API 中保留（`vol_change_24h_pct` 为空字符串），方便查看历史
-- `tv_watchlist_manager.py` 的 `fetch_symbols()` 自动过滤退出交易对，**只上传活跃的到 TV**
-
-**更新流程：**
+## 文件结构
 
 ```text
-GET  /api/v1/symbols_list/all/?source=web
-     → 查找"new"列表的 ID
-POST /api/v1/symbols_list/custom/{id}/replace/?unsafe=true  → 原地替换全部交易对
-```
-
-使用 `POST .../replace/?unsafe=true` 原地替换列表内容，**列表 ID 保持不变**，因此已设置的 TV 警报不会失效（如果用 DELETE + CREATE 的方式，ID 会变，警报就需要重新设置）。
-
-> body 格式为 **JSON 数组**，例如：`["BINANCE:ONGUSDT.P", "BINANCE:MAVIAUSDT.P"]`
-
-因为操作的是**个人自选表数据**，需要登录认证——首次使用需粘贴一次 TV cookie，之后保存在本地重复使用。
-
-### 首次使用：获取 Cookie
-
-**自动模式（推荐）：**
-
-```bash
-python tv_watchlist_manager.py cookie --auto
-```
-
-会自动打开浏览器窗口 → 你登录 TV → 回到终端按回车 → 脚本自动抓取全部 cookie（含 HttpOnly 的 `sessionid`）。
-
-**手动模式：**
-
-```bash
-python tv_watchlist_manager.py cookie
-```
-
-按提示操作：F12 → **Application → Cookies** → `https://www.tradingview.com` → 右键 Copy All → 粘贴
-
-> cookie 保存在 `data/tv_storage_state.json`，后续运行 `add --api` 会自动读取，无需重复设置。
-
-### 日常同步
-
-```bash
-# 日常：自动同步活跃异动交易对到 TV「new」自选表（自动过滤已退出的）
-python tv_watchlist_manager.py add --api
-```
-
-每次运行会**原地替换**列表内容，只上传活跃交易对（`vol_change_24h_pct` 有值），列表 ID 保持不变。
-
-### 完整命令
-
-| 命令 | 说明 |
-| :--- | :--- |
-| `cookie` | 首次设置 TV 登录 cookie（一次即可，后续复用） |
-| `add --api` | 自动上传活跃异动交易对到 TV 自选表（默认只保留活跃的） |
-| `list` | 查看当前活跃异动交易对列表 |
-| `export` | 导出 `.tvs` 文件（TV 手动导入: 右键自选 → 导入符号列表） |
-| `serve` | 启动网页服务 `http://localhost:3002`，浏览器中点一键复制 |
-| `url` | 生成 TV 图表/搜索链接 |
-
-```bash
-# 指定扫描器地址（默认连接服务器 43.165.167.132:3001）
-python tv_watchlist_manager.py list --api http://43.165.167.132:3001/api/data
-```
-
-### Cookie 说明
-
-| 项目 | 说明 |
-| :--- | :--- |
-| 保存位置 | `data/tv_storage_state.json` |
-| 有效期 | 同 TV 登录会话（一般数周） |
-| 重新设置 | cookie 过期后重新运行 `python tv_watchlist_manager.py cookie` |
-
-### 接口说明
-
-| 方法 | 接口 | body 格式 | 说明 |
-| :--- | :--- | :--- | :--- |
-| `POST` | `/api/v1/symbols_list/custom/{id}/replace/?unsafe=true` | `["SYM1", "SYM2"]` 数组 | **原地替换**列表内容，ID 不变 ✅ |
-| `POST` | `/api/v1/symbols_list/custom/{id}/append/` | `["SYM1"]` 数组 | 追加交易对到已有列表 |
-| `POST` | `/api/v1/symbols_list/custom/` | `{"name": "new", "symbols": [...]}` | 创建新自选表 |
-| `GET` | `/api/v1/symbols_list/all/?source=web` | — | 获取所有自选表 |
-| `GET` | `/api/v1/symbols_list/custom/{id}?source=web` | — | 获取单个自选表详情 |
-| `DELETE` | `/api/v1/symbols_list/custom/{id}/` | — | 删除自选表 |
-
----
-
-## 常用运维命令
-
-```bash
-# 连接到服务器
-ssh -i "43.165.167.132_id_ed25519" root@43.165.167.132
-
-# 查看 Freqtrade 运行状态
-ps aux | grep freqtrade | grep -v grep
-
-# 进入 screen 会话查看实时日志
-screen -r freqtrade
-
-# 退出 screen（不中断）
-Ctrl+A, D
-
-# 重启 Freqtrade
-screen -S freqtrade -X quit
-cd /www/wwwroot/freqtrade
-screen -dmS freqtrade bash -c '.venv/bin/freqtrade trade \
-  --strategy VolumeSurgeShortStrategy \
-  --userdir user_data \
-  -c user_data/config_trade_surge.json'
-
-# 查看数据库中的交易记录
-sqlite3 /www/wwwroot/freqtrade/tradesv3.dryrun.sqlite \
-  "SELECT id, pair, open_date, close_date, profit_ratio, stake_amount \
-   FROM trades ORDER BY close_date DESC LIMIT 10;"
-
+i:\1H\
+├── tv_binance_volume_screener.py    # 成交量异动扫描程序
+├── strategy_short_decline.py        # Freqtrade 纯做空 DCA 策略
+├── config_trade_surge.json          # Freqtrade 交易配置
+├── 43.165.167.132_id_ed25519        # SSH 密钥
+├── requirements.txt                 # Python 依赖
+├── data/
+│   └── volume_surge.db              # 扫描程序 SQLite 数据库
+└── README.md                        # 本文件
 ```
 
 ---
 
-## 杠杆配置注意事项
+## 常见问题
 
-### 杠杆调用链
+**Q：盈利很高却不平仓？**
+检查 `use_exit_signal` 是否为 `True`。设为 `False` 会导致 `custom_exit` 从不被调用，出场逻辑失效。
 
-```text
-freqtradebot.py::get_valid_enter_price_and_stake()
-  → exchange.get_max_leverage(pair, stake_amount)   # 获取 max_leverage
-  → strategy.leverage(pair, ..., max_leverage, ...) # 策略返回目标杠杆（如 10）
-  → leverage = min(max(leverage, 1.0), max_leverage) # 最终截断
+**Q：重启后已有持仓丢失止盈？**
+`_get_first_entry_state` 会从 `trade.orders` 恢复首仓价，无需依赖内存。若订单里读不到，回退用 `trade.open_rate`。
 
-```
-
-**关键：即使策略返回 10x，如果 `max_leverage == 1.0`，结果也是 1.0。**
-
-### 常见原因：新交易对不在杠杆分级文件中
-
-Freqtrade dry-run 模式下从本地文件读取杠杆分级数据：
-
-| 文件 | 路径 |
-| :--- | :--- |
-| 杠杆分级文件 | `/www/wwwroot/freqtrade/freqtrade/exchange/binance_leverage_tiers.json` |
-| 来源 | `binance.py::load_leverage_tiers()` — dry-run 读本地 JSON，实盘调 API |
-
-- 该文件**不会自动更新**，新上线的交易对（如 GME、CRWD）可能缺失
-- 缺失时 `get_max_leverage()` 返回 `1.0`，导致杠杆被强制截断为 1x
-- 修复方法：手动在 JSON 中添加缺失交易对的标准 tier（maxLeverage=75x 等），然后重启 Freqtrade
-
-### 策略 leverage() 回调
-
-```python
-def leverage(self, pair, current_time, current_rate,
-             proposed_leverage, max_leverage, entry_tag, side, **kwargs):
-    return self.config.get("futures_leverage", 1)
-
-```
-
-- `proposed_leverage` 固定为 1.0（Freqtrade 传参）
-- `max_leverage` 来自 `get_max_leverage()`，受 tiers 文件限制
-- 配置文件中使用 `"futures_leverage": 10`（下划线），CLI 参数为 `--futures-leverage`
-
----
-
-## 本地文件
-
-| 文件 | 说明 |
-| :--- | :--- |
-| `strategy_volume_surge.py` | 策略源码 |
-| `config.json` | 本地配置模板 |
-| `tv_binance_volume_screener.py` | TV Scanner API 成交量异动扫描器（HTTP 服务 + SQLite 历史记录） |
-| `tv_watchlist_manager.py` | TV 自选表管理器（自动上传活跃异动交易对到 TV） |
-| `requirements.txt` | Python 依赖 |
-| `data/volume_surge.db` | SQLite 数据库，记录交易对进入/退出时间 |
-| `data/tv_storage_state.json` | TV 登录 cookie（Playwright 格式） |
-| `data/tradingview_watchlist.tvs` | 导出的 .tvs 自选表文件 |
-
----
-
-## 遇到的问题及解决
-
-### 问题1：Whitelist 只显示 3 个交易对 (IBM/ALAB/UBER)
-
-**症状**：RemotePairList API 返回 50+ 个交易对，但 Freqtrade whitelist 只有 3 个。
-
-**原因**：API 返回格式为 `SAFE/USDT`，但 Binance 合约市场使用 `SAFE/USDT:USDT`。Freqtrade 的 `expand_pairlist()` 用 `re.fullmatch()` 做精确匹配，导致 `SAFE/USDT` 匹配不上 `SAFE/USDT:USDT`，所有交易对被静默丢弃。
-
-**修复**：在 `_serve_pairlist()` 中给交易对添加 `:USDT` 后缀：
-
-```python
-pair = self._tv_to_pair(r.get("name", ""))
-if pair.endswith("/USDT"):
-    pair = f"{pair}:USDT"
-elif pair.endswith("/USDC"):
-    pair = f"{pair}:USDC"
-
-```
-
-### 问题2：AgeFilter 无效
-
-**原因**：同问题1，所有交易对在 expand_pairlist 阶段已被丢弃，AgeFilter 无可过滤的对象。格式正确后 AgeFilter 正常工作。
-
-### 问题3：AgeFilter 使用日线 K 线数据量而非 onboardDate
-
-**说明**：AgeFilter 不使用交易所 API 的 `onboardDate` 字段，而是下载 1d 日线 K 线，统计多少根日线来判断上市天数。若某个交易对日线数据下载失败，该交易对会被移除。
-
-### 问题4：扫描程序 HTTP 服务阻塞 / socket 泄漏导致无法连接
-
-**症状**：进程在运行，但 HTTP 端口 3001 无法建立新连接，`ss -tnp` 显示大量 `CLOSE-WAIT` 状态的连接，或线程卡在 `tcp_recvmsg` 等待客户端数据。
-
-**原因**：单线程 `HTTPServer` 容易被半开连接阻塞；同时 `BaseHTTPRequestHandler` 的 keep-alive 行为会让客户端断开后的 socket 长时间滞留，运行数天后可能积累 CLOSE-WAIT 连接，导致新请求无法被接受。
-
-**修复**：
-
-- 使用 `ThreadingHTTPServer`，单个异常连接不阻塞其他请求
-- `VolumeSurgeHandler.close_connection = True`，每次请求后主动关闭连接
-- 在 `setup()` 中设置 `HTTP_REQUEST_TIMEOUT = 10` 秒，避免半开连接长时间占用线程
-- 监听地址改为 `127.0.0.1:3001`，公网只通过 Nginx 域名反代访问
-
-```python
-HTTP_HOST = "127.0.0.1"
-HTTP_REQUEST_TIMEOUT = 10
-
-class VolumeSurgeHandler(BaseHTTPRequestHandler):
-  close_connection = True
-
-  def setup(self):
-    self.request.settimeout(HTTP_REQUEST_TIMEOUT)
-    super().setup()
-
-server = ThreadingHTTPServer((HTTP_HOST, HTTP_PORT), VolumeSurgeHandler)
-```
-
-### 问题5：`/api/data` 展示数据与 Freqtrade 活跃列表混用
-
-**症状**：`latest_exited_count` 有值，但页面 `results` 中没有退出交易对，前端无法显示退出记录；或者为了显示退出记录而影响 Freqtrade 白名单。
-
-**原因**：展示列表和交易列表都使用同一个 `_latest_scan`，语义混在一起。
-
-**修复**：拆成两个全局状态：
-
-- `_latest_scan`：页面展示数据，包含当前活跃 + 已退出历史
-- `_latest_active_scan`：交易接口数据，只包含当前仍满足 >500% 条件的活跃交易对
-
-接口分工：
-
-| 接口 | 数据范围 |
-| :--- | :--- |
-| `/api/data` | 当前活跃 + 已退出历史 |
-| `/api/list` | 最近 60 分钟进入且仍活跃的交易对 |
-| `/api/pairlist` | 所有当前活跃交易对，供 Freqtrade RemotePairList 使用 |
+**Q：杠杆变成 1x？**
+dry-run 从 `freqtrade/exchange/binance_leverage_tiers.json` 读杠杆分级，新上线交易对缺失时 `max_leverage` 返回 1.0。手动补该交易对的 tier 后重启。

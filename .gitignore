@@ -4,22 +4,30 @@ __pycache__/
 venv/
 .env
 
-# Êý¾ÝÄ¿Â¼£¨CSV ÀúÊ·¼ÇÂ¼±£Áô£¬µ«µ¥¸ö±ÒÖÖÊý¾Ý¿ÉºöÂÔ£©
+# ï¿½ï¿½ï¿½ï¿½Ä¿Â¼ï¿½ï¿½CSV ï¿½ï¿½Ê·ï¿½ï¿½Â¼ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ý¿Éºï¿½ï¿½Ô£ï¿½
 data/BTCUSDT/
 
-# ÏµÍ³ÎÄ¼þ
+# ÏµÍ³ï¿½Ä¼ï¿½
 Thumbs.db
 .DS_Store
 
-# SSH ÃÜÔ¿
+# SSH ï¿½ï¿½Ô¿
 *_id_ed25519
 *_id_rsa
 *.pem
 
 .venv/
 
+# ä¸´æ—¶è¯Šæ–­è„šæœ¬
+_check_*.py
+_debug_*.py
+_dump_state.py
+_patch_scanner.py
+_tv_payload.json
+*.log
+
 test_*.txt
 
-# Êý¾Ý¿â
+# ï¿½ï¿½ï¿½Ý¿ï¿½
 *.db
 *.bak

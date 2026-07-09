@@ -1,8 +1,21 @@
 """
-TradingView 筛选器：定时获取币安永续合约中 24h 成交量涨跌 > 500% 的交易对
-每分钟更新一次，历史数据保存在 SQLite 数据库（最多保留 50 条）。
-包含 TV 技术评级 (Recommend.All / RSI) 及 1周/1月/3月涨幅。
-使用 TradingView Scanner API (非官方)
+成交量异动扫描程序 — TradingView Scanner API
+============================================
+
+功能：
+  - 每分钟轮询 TradingView Scanner API，筛选币安 USDT 永续合约中
+    24h 成交量变化 > 500% 的交易对
+  - 交易对首次出现后保留 30 分钟（ACTIVE_DURATION_MINUTES），
+    超时自动从 pairlist 移除
+  - 退出后重新满足条件时重置计时器
+  - 历史数据保存在 SQLite（data/volume_surge.db），最多保留 50 条
+  - 所有数值字段经过 _to_float_or_none() 清洗，确保下游不收到脏数据
+
+HTTP API（127.0.0.1:3001）：
+  /              → HTML 监控看板
+  /api/data      → 完整扫描结果（含已退出历史）
+  /api/list      → 活跃交易对 + 技术指标（供 Freqtrade 策略轮询）
+  /api/pairlist  → RemotePairList 格式（供 Freqtrade 配置引用）
 """
 
 import json
@@ -26,13 +39,13 @@ HTTP_HOST = "127.0.0.1"  # 仅本机监听，由 Nginx 反代到公网域名
 HTTP_PORT = 3001  # HTTP 服务器端口
 MAX_DISPLAY_RESULTS = 30  # 最多显示记录数
 MAX_HISTORY_RECORDS = 50  # 数据库最多保留记录数
-RECENT_ENTRY_MINUTES = 60  # 给 Freqtrade 拉取新增交易对的容错窗口
+ACTIVE_DURATION_MINUTES = 30  # 交易对在 pairlist 中最长保留时间（分钟）
 HTTP_REQUEST_TIMEOUT = 10  # 防止半开连接阻塞 HTTP 线程
 # ==============================================
 
 # 全局状态
 _running = True
-_seen_symbols: set[str] = set()  # 已写入 CSV 的交易对（内存缓存）
+_seen_symbols: set[str] = set()  # 所有曾出现的交易对（内存缓存，与 DB 同步）
 
 
 def signal_handler(sig, frame):
@@ -53,12 +66,8 @@ _latest_timestamp: str = ""
 _scan_lock = threading.Lock()
 # ====================================================
 
-# 上一次扫描的交易对名称集合，用于检测退出
+# 上一次扫描的交易对名称集合，用于检测退出（仅用于历史记录）
 _previous_scan_symbols: set[str] = set()
-# 上一轮各交易对的成交量变化值，用于检测"上穿"
-_prev_vol_change: dict[str, float] = {}
-# 当前活跃的交易对（已上穿且尚未下穿）
-_active_symbols: set[str] = set()
 
 # 交易对进入/退出时间记录
 _symbol_entry_time: dict[str, str] = {}  # name -> 首次进入时间
@@ -100,7 +109,7 @@ class VolumeSurgeHandler(BaseHTTPRequestHandler):
                 item["exit_time"] = _symbol_exit_time.get(r["name"], "")
                 # 技术评级: 数值转文字
                 rec = r.get("recommend_all")
-                if rec is not None:
+                if isinstance(rec, (int, float)):
                     if rec > 0.5:
                         item["rating_text"] = "🟢强烈买入"
                     elif rec > 0.2:
@@ -156,19 +165,14 @@ class VolumeSurgeHandler(BaseHTTPRequestHandler):
 
     def _serve_list(self):
         """
-        /api/list — 仅返回最近进入且仍活跃的交易对及趋势数据，供 Freqtrade 策略使用。
+        /api/list — 返回当前活跃交易对及趋势数据，供 Freqtrade 策略使用。
+        数据源 _latest_active_scan 已由主循环按 ACTIVE_DURATION_MINUTES 过滤。
         返回格式: [{"pair": "SAFE/USDT", "perf_1w": -10.87, ...}]
         """
-        recent_cutoff = (
-            datetime.now() - timedelta(minutes=RECENT_ENTRY_MINUTES)
-        ).strftime("%Y-%m-%d %H:%M:%S")
         with _scan_lock:
             results = []
             for r in _latest_active_scan:
                 name = r.get("name", "")
-                entry = _symbol_entry_time.get(name, "")
-                if not entry or entry < recent_cutoff:
-                    continue
                 pair = self._tv_to_pair(name)
                 results.append(
                     {
@@ -176,6 +180,7 @@ class VolumeSurgeHandler(BaseHTTPRequestHandler):
                         "price": r.get("price"),
                         "vol_24h": r.get("vol_24h"),
                         "vol_change_24h_pct": r.get("vol_change_24h_pct"),
+                        "price_change_24h_pct": r.get("price_change_24h_pct"),
                         "perf_1w": r.get("perf_1w"),
                         "perf_1m": r.get("perf_1m"),
                         "perf_3m": r.get("perf_3m"),
@@ -308,7 +313,7 @@ tr.row-exited:hover td { background: linear-gradient(135deg,
         <div class="stats" id="stats">
             <div class="stat-item"><div class="label">最后更新</div><div class="value" id="stat-time">-</div></div>
             <div class="stat-item"><div class="label">当前结果</div><div class="value" id="stat-total">-</div></div>
-            <div class="stat-item"><div class="label">1h内新增</div><div class="value" id="stat-new">-</div></div>
+            <div class="stat-item"><div class="label">30min内新增</div><div class="value" id="stat-new">-</div></div>
             <div class="stat-item"><div class="label">已退出</div><div class="value" id="stat-exited">-</div></div>
             <div class="stat-item"><div class="label">历史累计</div><div class="value" id="stat-hist">-</div></div>
         </div>
@@ -333,7 +338,7 @@ tr.row-exited:hover td { background: linear-gradient(135deg,
         <tbody id="table-body"><tr><td colspan="12" style="text-align:center;padding:40px;color:#6a7a8a">加载中...</td></tr></tbody>
     </table>
     <div class="footer" id="footer">
-        条件: 24h成交量变化 &gt; 500% &nbsp;|&nbsp; 更新间隔: 60s &nbsp;|&nbsp; 🟢 绿色竖条=1小时内新增 &nbsp;|&nbsp; 🟠 橙色竖条=已退出
+        条件: 24h成交量变化 &gt; 500% &nbsp;|&nbsp; 更新间隔: 60s &nbsp;|&nbsp; 🟢 绿色竖条=30分钟内新增 &nbsp;|&nbsp; 🟠 橙色竖条=已退出
         &nbsp;|&nbsp; <a href="javascript:void(0)" id="notif-btn" onclick="enableNotifications()" style="color:#f0b90b;text-decoration:none;font-weight:600">🔔 开启桌面通知</a>
     </div>
 </div>
@@ -503,6 +508,16 @@ def start_http_server():
     return server, thread
 
 
+def _to_float_or_none(val):
+    """安全转换为 float，无效值返回 None。"""
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
 def get_binance_perpetual_volume_surge(
     min_vol_change_pct: float = MIN_VOL_CHANGE_PCT,
     max_results: int = MAX_RESULTS,
@@ -576,27 +591,36 @@ def get_binance_perpetual_volume_surge(
 
     results = []
     for item in data.get("data", []):
-        d = item["d"]
-        results.append(
-            {
-                "symbol": item["s"],
-                "name": d[0],
-                "price": d[1],
-                "type": d[2],
-                "exchange": d[3],
-                "vol_change_24h_pct": d[4],
-                "vol_24h": d[5],
-                "price_change_24h_pct": d[6] if len(d) > 6 else None,
-                "currency": d[7] if len(d) > 7 else None,
-                "recommend_all": d[8] if len(d) > 8 else None,
-                "recommend_ma": d[9] if len(d) > 9 else None,
-                "recommend_other": d[10] if len(d) > 10 else None,
-                "rsi": d[11] if len(d) > 11 else None,
-                "perf_1w": d[12] if len(d) > 12 else None,
-                "perf_1m": d[13] if len(d) > 13 else None,
-                "perf_3m": d[14] if len(d) > 14 else None,
-            }
-        )
+        try:
+            d = item.get("d")
+            if not isinstance(d, (list, tuple)) or len(d) < 6:
+                continue
+            results.append(
+                {
+                    "symbol": item.get("s", ""),
+                    "name": d[0] or "",
+                    "price": _to_float_or_none(d[1]),
+                    "type": d[2] or "",
+                    "exchange": d[3] or "",
+                    "vol_change_24h_pct": _to_float_or_none(d[4]),
+                    "vol_24h": _to_float_or_none(d[5]),
+                    "price_change_24h_pct": _to_float_or_none(d[6])
+                    if len(d) > 6
+                    else None,
+                    "currency": d[7] if len(d) > 7 else None,
+                    "recommend_all": _to_float_or_none(d[8]) if len(d) > 8 else None,
+                    "recommend_ma": _to_float_or_none(d[9]) if len(d) > 9 else None,
+                    "recommend_other": _to_float_or_none(d[10])
+                    if len(d) > 10
+                    else None,
+                    "rsi": _to_float_or_none(d[11]) if len(d) > 11 else None,
+                    "perf_1w": _to_float_or_none(d[12]) if len(d) > 12 else None,
+                    "perf_1m": _to_float_or_none(d[13]) if len(d) > 13 else None,
+                    "perf_3m": _to_float_or_none(d[14]) if len(d) > 14 else None,
+                }
+            )
+        except (IndexError, KeyError, TypeError, ValueError):
+            continue
     return results
 
 
@@ -621,30 +645,6 @@ def init_db():
         )
     """)
     conn.commit()
-
-    # 检查是否有旧 CSV 数据需要迁移
-    count = conn.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
-    if count == 0:
-        csv_file = Path(__file__).parent / "data" / "binance_volume_surge_history.csv"
-        if csv_file.exists():
-            import csv
-
-            migrated = 0
-            with open(csv_file, "r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    try:
-                        conn.execute(
-                            "INSERT OR IGNORE INTO symbols (name, entry_time, symbol) VALUES (?, ?, ?)",
-                            (row["name"], row["first_seen"], row["symbol"]),
-                        )
-                        migrated += 1
-                    except Exception:
-                        pass
-            conn.commit()
-            # 迁移后清理旧 CSV
-            csv_file.rename(csv_file.with_suffix(".csv.bak"))
-            print(f"  已从 CSV 迁移 {migrated} 条记录到 SQLite")
     conn.close()
 
 
@@ -763,7 +763,7 @@ def print_results(
     print(f"  时间: {timestamp}")
     print(f"  条件: 币安永续合约 24h成交量涨跌 > {MIN_VOL_CHANGE_PCT}%")
     print(
-        f"  显示 {len(results)} 个 | 1h内新增 {new_count} 个 | 已退出 {len(exited_names)} 个 | 历史累计 {len(_seen_symbols)} 个"
+        f"  显示 {len(results)} 个 | {ACTIVE_DURATION_MINUTES}min内新增 {new_count} 个 | 已退出 {len(exited_names)} 个 | 历史累计 {len(_seen_symbols)} 个"
     )
     print(f"{'=' * 95}")
 
@@ -776,8 +776,10 @@ def print_results(
     )
     print("-" * 114)
     for i, r in enumerate(display, 1):
-        name = r["name"]
-        price = f"{r['price']}" if r.get("price") else "-"
+        name = r.get("name", "")
+        if not name:
+            continue
+        price = f"{r.get('price', '')}" if r.get("price") else "-"
         try:
             vol_chg = f"{float(r['vol_change_24h_pct']):.1f}%"
         except (ValueError, TypeError):
@@ -833,7 +835,7 @@ def main_loop():
     print(f"  阈值: 24h成交量变化 > {MIN_VOL_CHANGE_PCT}%")
     print(f"  最多显示: {MAX_DISPLAY_RESULTS} 条")
     print(f"  数据库最多保留: {MAX_HISTORY_RECORDS} 条记录")
-    print(f"  交易接口新增窗口: {RECENT_ENTRY_MINUTES} 分钟")
+    print(f"  交易对活跃时长: {ACTIVE_DURATION_MINUTES} 分钟")
     print(f"  数据库: {DB_PATH}")
     print(f"  历史已记录: {len(_seen_symbols)} 个交易对")
     print(f"  HTTP 显示: http://{HTTP_HOST}:{HTTP_PORT}")
@@ -863,14 +865,28 @@ def main_loop():
             # 保存新增到DB
             save_to_db(active_data, timestamp)
 
-            # ---- NEW 标记：1小时内进入的 ----
-            one_hour_ago = (datetime.now() - timedelta(hours=1)).strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
+            # ── 重新进入检测：已退出的交易对再次出现时，重置 entry_time ──
+            now_str = timestamp
+            for name in list(current_names):
+                if name in _symbol_exit_time:
+                    conn = get_db()
+                    conn.execute(
+                        "UPDATE symbols SET exit_time = NULL, entry_time = ? WHERE name = ?",
+                        (now_str, name),
+                    )
+                    conn.commit()
+                    conn.close()
+                    _symbol_entry_time[name] = now_str
+                    del _symbol_exit_time[name]
+
+            # ---- NEW 标记：ACTIVE_DURATION_MINUTES 内进入的 ----
+            new_cutoff = (
+                datetime.now() - timedelta(minutes=ACTIVE_DURATION_MINUTES)
+            ).strftime("%Y-%m-%d %H:%M:%S")
             new_names_set = {
                 r["name"]
                 for r in active_data
-                if _symbol_entry_time.get(r["name"], "") >= one_hour_ago
+                if _symbol_entry_time.get(r["name"], "") >= new_cutoff
             }
 
             # ---- EXIT 标记：DB中所有有退出时间的 ----
@@ -878,6 +894,7 @@ def main_loop():
 
             # ---- 从DB获取已退出交易对，追加到显示列表 ----
             all_display = list(active_data)
+            active_names = {r["name"] for r in active_data}
             conn = get_db()
             exited_rows = conn.execute(
                 "SELECT name, symbol, exit_time FROM symbols WHERE exit_time IS NOT NULL ORDER BY exit_time DESC"
@@ -885,7 +902,7 @@ def main_loop():
             conn.close()
             for row in exited_rows:
                 name = row["name"]
-                if name not in set(r["name"] for r in all_display):
+                if name not in active_names:
                     all_display.append(
                         {
                             "name": name,
@@ -923,8 +940,15 @@ def main_loop():
             with _scan_lock:
                 # _latest_scan 用于页面展示，包含当前活跃和已退出记录
                 _latest_scan = list(all_display)
-                # _latest_active_scan 用于 Freqtrade 拉取，只包含当前仍 >500% 的交易对
-                _latest_active_scan = list(active_data)
+                # _latest_active_scan 用于 Freqtrade 拉取，只包含进入后 30 分钟内的交易对
+                active_cutoff = (
+                    datetime.now() - timedelta(minutes=ACTIVE_DURATION_MINUTES)
+                ).strftime("%Y-%m-%d %H:%M:%S")
+                _latest_active_scan = [
+                    r
+                    for r in active_data
+                    if _symbol_entry_time.get(r["name"], "") >= active_cutoff
+                ]
                 _latest_timestamp = timestamp
                 _latest_new_symbols = new_names_set
                 _latest_exited_symbols = exited_names_set
@@ -932,7 +956,9 @@ def main_loop():
             error_count += 1
             print(f"  [{timestamp}] 错误: {e}")
             if error_count >= 5:
-                print(f"  连续 {error_count} 次失败，5秒后重试...")
+                print(
+                    f"  连续 {error_count} 次失败，将在下一次 {INTERVAL_SECONDS} 秒轮询时重试..."
+                )
 
         # 等待下一次更新（支持 Ctrl+C 即时中断）
         for _ in range(INTERVAL_SECONDS):

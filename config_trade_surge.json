@@ -1,6 +1,6 @@
 {
   "dry_run": true,
-  "dry_run_wallet": 1000,
+  "dry_run_wallet": 2000,
   "max_open_trades": 10,
   "stake_currency": "USDT",
   "stake_amount": 100,
@@ -26,12 +26,12 @@
     }
   ],
   "entry_pricing": {
-    "price_side": "same",
+    "price_side": "other",
     "use_order_book": true,
     "order_book_top": 1
   },
   "exit_pricing": {
-    "price_side": "same",
+    "price_side": "other",
     "use_order_book": true,
     "order_book_top": 1
   },
