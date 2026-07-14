@@ -11,7 +11,7 @@
 加仓: 逆势上涨触发, 间隔按斐波那契数列递增, 基准100U保证金, 最多加5次
       累计触发涨幅: +10% / +20% / +40% / +70% / +120%
 离场:
-    基于加权持仓均价移动止盈，并按15m波动率动态调整参数
+    基于加权持仓均价移动止盈（激活15%、回撤5%）
 止损: 1000%
 """
 
@@ -70,16 +70,9 @@ class ShortDeclineStrategy(IStrategy):
     # ── 加仓参数 ──
     short_add_threshold = 0.10  # 斐波那契基准间隔（相对首仓价）
 
-    # ── 移动止盈参数（相对加权均价，按15m ATR%分档） ──
-    volatility_period = 20
-    low_volatility_threshold = 0.02
-    high_volatility_threshold = 0.05
-    low_vol_trail_activate = 0.04
-    low_vol_trail_pullback = 0.02
-    mid_vol_trail_activate = 0.06
-    mid_vol_trail_pullback = 0.03
-    high_vol_trail_activate = 0.10
-    high_vol_trail_pullback = 0.05
+    # ── 移动止盈参数（相对加权均价） ──
+    trail_activate = 0.15  # 价格低于均价 15% 激活移动止盈
+    trail_pullback = 0.05  # 从持仓最低价反弹 5% 平仓
 
     # ── ADX 排序（仅用于入场优先级）──
     adx_period = 14
@@ -95,7 +88,6 @@ class ShortDeclineStrategy(IStrategy):
     _first_entry_price: dict[str, float] = {}
     _first_entry_qty: dict[str, float] = {}  # 首次开仓的币数量（用于DCA保持相同数量）
     _lowest_price: dict[str, float] = {}  # 持仓期间最低价（用于移动止盈）
-    _volatility_cache: dict[str, float] = {}  # 最近15m ATR%（用于移动止盈分档）
     _api_lock = threading.Lock()
     _last_api_fetch: float = 0
     _api_update_interval = 60
@@ -120,14 +112,10 @@ class ShortDeclineStrategy(IStrategy):
         minus_di = 100 * s_minus / s_tr
         dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di)).fillna(0)
         adx = dx.ewm(span=self.adx_period, adjust=False).mean()
-        volatility = tr.rolling(self.volatility_period).mean() / close
 
         pair = self._norm_pair(metadata.get("pair", ""))
-        latest_volatility = self._safe_float(volatility.iloc[-1])
         with self._api_lock:
             self._adx_cache[pair] = float(adx.iloc[-1])
-            if latest_volatility is not None:
-                self._volatility_cache[pair] = latest_volatility
 
         self._fetch_perf_data()
         return dataframe
@@ -217,7 +205,6 @@ class ShortDeclineStrategy(IStrategy):
         return first_entry, first_qty
 
     @staticmethod
-    @staticmethod
     def _is_eligible(
         perf_1w: float, perf_1m: float, perf_3m: float, chg_24h: float
     ) -> bool:
@@ -283,38 +270,6 @@ class ShortDeclineStrategy(IStrategy):
 
     def _norm_pair(self, pair: str) -> str:
         return pair.split(":")[0] if ":" in pair else pair
-
-    def _trailing_params(self, pair: str) -> tuple[float, float, str, Optional[float]]:
-        with self._api_lock:
-            volatility = self._volatility_cache.get(pair)
-
-        if volatility is None:
-            return (
-                self.mid_vol_trail_activate,
-                self.mid_vol_trail_pullback,
-                "unknown",
-                None,
-            )
-        if volatility < self.low_volatility_threshold:
-            return (
-                self.low_vol_trail_activate,
-                self.low_vol_trail_pullback,
-                "low",
-                volatility,
-            )
-        if volatility >= self.high_volatility_threshold:
-            return (
-                self.high_vol_trail_activate,
-                self.high_vol_trail_pullback,
-                "high",
-                volatility,
-            )
-        return (
-            self.mid_vol_trail_activate,
-            self.mid_vol_trail_pullback,
-            "mid",
-            volatility,
-        )
 
     # ── 入场 ──
 
@@ -393,12 +348,9 @@ class ShortDeclineStrategy(IStrategy):
         current_drop_from_avg = (avg_entry - current_rate) / avg_entry
         # 从最低点反弹幅度
         rebound = (current_rate - low) / low if low > 0 else 0.0
-        trail_activate, trail_pullback, vol_bucket, volatility = self._trailing_params(
-            np
-        )
 
         logger.info(
-            "custom_exit %s avg=%s low=%s cur=%s drop=%.3f cur_drop=%.3f profit=%.3f rebound=%.3f vol_bucket=%s vol=%s activate=%.3f pullback=%.3f",
+            "custom_exit %s avg=%s low=%s cur=%s drop=%.3f cur_drop=%.3f profit=%.3f rebound=%.3f activate=%.3f pullback=%.3f",
             trade.pair,
             avg_entry,
             low,
@@ -407,20 +359,18 @@ class ShortDeclineStrategy(IStrategy):
             current_drop_from_avg,
             current_profit,
             rebound,
-            vol_bucket,
-            volatility,
-            trail_activate,
-            trail_pullback,
+            self.trail_activate,
+            self.trail_pullback,
         )
 
-        # 移动止盈：价格已低于均价动态激活阈值，且从最低点反弹动态阈值 → 平仓
+        # 移动止盈：价格已低于均价激活阈值，且从最低点反弹回撤阈值 → 平仓
         if (
             current_drop_from_avg > 0
             and current_profit > 0
-            and drop_from_avg >= trail_activate
-            and rebound >= trail_pullback
+            and drop_from_avg >= self.trail_activate
+            and rebound >= self.trail_pullback
         ):
-            return f"trailing_take_profit_{vol_bucket}_vol"
+            return "trailing_take_profit"
         return None
 
     def confirm_trade_entry(
