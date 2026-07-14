@@ -63,7 +63,7 @@ strategy_short_decline.py  ── Freqtrade 纯做空 DCA 策略（ShortDeclineS
 | 监控中的交易对费率恢复到 **≥ -0.05%** | 自动解除限制，重新加入开仓候选 |
 | 长期停留在监控列表中且已不在扫描结果中 | 自动清理（防内存泄漏） |
 
-阈值在策略代码中通过 `funding_rate_threshold` 定义，默认 `-0.0005`（即 -0.05%）。
+阈值在策略代码中通过 `funding_rate_threshold` 定义，默认 `-0.005`（即 -0.5%）。
 
 **筛选流程：**
 

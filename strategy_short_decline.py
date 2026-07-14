@@ -92,9 +92,9 @@ class ShortDeclineStrategy(IStrategy):
     # ── 资金费率 ──
     _funding_rate_cache: dict[
         str, float
-    ] = {}  # pair -> 当前资金费率（如 -0.0005 = -0.05%）
+    ] = {}  # pair -> 当前资金费率（如 -0.005 = -0.5%）
     _funding_watch_pairs: set[str] = set()  # 因资金费率过负被暂缓的交易对
-    funding_rate_threshold = -0.0005  # 资金费率阈值 -0.05%，仅由策略代码定义
+    funding_rate_threshold = -0.005  # 资金费率阈值 -0.5%，仅由策略代码定义
 
     _api_lock = threading.Lock()
     _last_api_fetch: float = 0
@@ -350,7 +350,7 @@ class ShortDeclineStrategy(IStrategy):
 
         接口: GET /fapi/v1/premiumIndex
         返回示例: {"symbol":"BTCUSDT","lastFundingRate":"0.0001",...}
-        阈值 funding_rate_threshold = -0.0005 即 -0.05%，策略代码中定义
+        阈值 funding_rate_threshold = -0.005 即 -0.5%，策略代码中定义
         """
         try:
             resp = requests.get(
