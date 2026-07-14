@@ -94,7 +94,7 @@ class ShortDeclineStrategy(IStrategy):
         str, float
     ] = {}  # pair -> 当前资金费率（如 -0.0005 = -0.05%）
     _funding_watch_pairs: set[str] = set()  # 因资金费率过负被暂缓的交易对
-    _funding_rate_threshold = -0.0005  # 资金费率阈值 -0.05%
+    funding_rate_threshold = -0.0005  # 默认 -0.05%，可被 config.json 中同名参数覆盖
 
     _api_lock = threading.Lock()
     _last_api_fetch: float = 0
@@ -129,13 +129,6 @@ class ShortDeclineStrategy(IStrategy):
         return dataframe
 
     # ── 获取扫描器数据 ──
-
-    def _tv_to_pair(self, raw: str) -> str:
-        name = raw.replace(".P", "")
-        for quote in ("USDT", "USDC", "BUSD"):
-            if name.endswith(quote) and len(name) > len(quote):
-                return f"{name[: -len(quote)]}/{quote}"
-        return f"{name}/USDT"
 
     @staticmethod
     def _safe_float(value) -> Optional[float]:
@@ -242,6 +235,7 @@ class ShortDeclineStrategy(IStrategy):
             return
         try:
             resp = requests.get(self.scanner_data_url, timeout=10)
+            all_scanner_pairs: set[str] = set()
             if resp.status_code == 200:
                 data = resp.json()
                 results = data.get("results", []) if isinstance(data, dict) else data
@@ -256,10 +250,23 @@ class ShortDeclineStrategy(IStrategy):
                         if not name:
                             continue
                         pair_key = (
-                            self._tv_to_pair(name).split(":")[0]
-                            if "/" not in name
-                            else name.split(":")[0]
+                            name.split(":")[0]
+                            if "/" in name
+                            else name.replace(".P", "").split(":")[0]
                         )
+                        # 标准化：去掉后缀如 :USDT
+                        pair_key = pair_key.split(":")[0]
+                        # 确保是 xxx/USDT 格式
+                        if "/" not in pair_key:
+                            for quote in ("USDT", "USDC", "BUSD"):
+                                if pair_key.endswith(quote) and len(pair_key) > len(
+                                    quote
+                                ):
+                                    pair_key = f"{pair_key[: -len(quote)]}/{quote}"
+                                    break
+                            else:
+                                pair_key = f"{pair_key}/USDT"
+                        all_scanner_pairs.add(pair_key)
                         perf_1w = self._safe_float(r.get("perf_1w"))
                         perf_1m = self._safe_float(r.get("perf_1m"))
                         perf_3m = self._safe_float(r.get("perf_3m"))
@@ -274,19 +281,22 @@ class ShortDeclineStrategy(IStrategy):
                             self._eligible_pairs.add(pair_key)
                     self._last_api_fetch = now
 
-            # ── 资金费率过滤 ──
+            # ── 资金费率过滤（使用可配置阈值） ──
+            fr_threshold = float(
+                self.config.get("funding_rate_threshold", self.funding_rate_threshold)
+            )
             self._fetch_funding_rates()
             funding_blocked: set[str] = set()
             for pair in list(self._eligible_pairs):
                 fr = self._funding_rate_cache.get(pair)
-                if fr is not None and fr < self._funding_rate_threshold:
+                if fr is not None and fr < fr_threshold:
                     funding_blocked.add(pair)
                     self._funding_watch_pairs.add(pair)
                     logger.info(
                         "[ShortDecline] %s 资金费率 %.6f < %.4f，暂缓开空（加入监控）",
                         pair,
                         fr,
-                        self._funding_rate_threshold,
+                        fr_threshold,
                     )
             self._eligible_pairs -= funding_blocked
 
@@ -294,34 +304,41 @@ class ShortDeclineStrategy(IStrategy):
             recovered: set[str] = set()
             for pair in list(self._funding_watch_pairs):
                 fr = self._funding_rate_cache.get(pair)
-                if fr is not None and fr >= self._funding_rate_threshold:
+                if fr is not None and fr >= fr_threshold:
                     recovered.add(pair)
-                    # 重新检查是否还在扫描器结果中（仍然满足其他条件）
-                    if pair in self._eligible_pairs:
+                    perf_1w = self._perf_1w_cache.get(pair)
+                    perf_1m = self._perf_1m_cache.get(pair)
+                    perf_3m = self._perf_3m_cache.get(pair)
+                    chg_24h = self._price_change_24h_cache.get(pair)
+                    if None not in (
+                        perf_1w,
+                        perf_1m,
+                        perf_3m,
+                        chg_24h,
+                    ) and self._is_eligible(perf_1w, perf_1m, perf_3m, chg_24h):
+                        self._eligible_pairs.add(pair)
                         logger.info(
-                            "[ShortDecline] %s 资金费率已恢复 %.6f，解除限制",
+                            "[ShortDecline] %s 资金费率已恢复 %.6f，重新加入候选",
                             pair,
                             fr,
                         )
                     else:
-                        # 之前满足条件但因费率被拦，现在费率恢复，重新加入候选
-                        perf_1w = self._perf_1w_cache.get(pair)
-                        perf_1m = self._perf_1m_cache.get(pair)
-                        perf_3m = self._perf_3m_cache.get(pair)
-                        chg_24h = self._price_change_24h_cache.get(pair)
-                        if None not in (
-                            perf_1w,
-                            perf_1m,
-                            perf_3m,
-                            chg_24h,
-                        ) and self._is_eligible(perf_1w, perf_1m, perf_3m, chg_24h):
-                            self._eligible_pairs.add(pair)
-                            logger.info(
-                                "[ShortDecline] %s 资金费率已恢复 %.6f，重新加入候选",
-                                pair,
-                                fr,
-                            )
+                        logger.info(
+                            "[ShortDecline] %s 资金费率已恢复 %.6f，但其他条件不再满足，放弃监控",
+                            pair,
+                            fr,
+                        )
             self._funding_watch_pairs -= recovered
+
+            # ── 清理监控列表中已不在扫描结果的僵尸交易对 ──
+            stale_watch = {
+                p
+                for p in self._funding_watch_pairs
+                if p not in self._perf_1w_cache and p not in all_scanner_pairs
+            }
+            if stale_watch:
+                logger.info("[ShortDecline] 清理僵尸监控 %s", stale_watch)
+                self._funding_watch_pairs -= stale_watch
         except Exception as e:
             print(f"[ShortDecline] 获取扫描器数据失败: {e}")
 
@@ -475,12 +492,13 @@ class ShortDeclineStrategy(IStrategy):
 
         # ADX 优先级：首次开仓按 ADX 从高到低排序，只有最高 ADX 的交易对才能入场
         if entry_tag == "short_decline":
+            # 先获取持仓列表（DB 查询，放在锁外避免阻塞）
+            open_pairs = {
+                t.pair.split(":")[0] for t in Trade.get_trades_proxy(is_open=True)
+            }
             with self._api_lock:
                 my_adx = self._adx_cache.get(np, 0)
                 eligible_pairs = set(self._eligible_pairs)
-                open_pairs = {
-                    t.pair.split(":")[0] for t in Trade.get_trades_proxy(is_open=True)
-                }
                 for p, adx in sorted(self._adx_cache.items(), key=lambda x: -x[1]):
                     if (
                         p in eligible_pairs
@@ -493,10 +511,13 @@ class ShortDeclineStrategy(IStrategy):
                         break
 
         # 确认入场后才记录首仓价格和数量
+        # ⚠️ 注意：amount 是保证金（stake），需要换算为币数量
+        leverage = float(self.config.get("futures_leverage", 10))
+        coin_qty = amount * leverage / rate if rate > 0 else amount
         with self._api_lock:
             if np not in self._first_entry_price:
                 self._first_entry_price[np] = rate
-                self._first_entry_qty[np] = amount  # 记录首次开仓的币数量
+                self._first_entry_qty[np] = coin_qty  # 存储首次开仓的币数量
         return True
 
     def adjust_trade_position(
