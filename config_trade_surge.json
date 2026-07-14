@@ -8,6 +8,7 @@
   "trading_mode": "futures",
   "margin_mode": "cross",
   "futures_leverage": 10,
+  "funding_rate_threshold": -0.0005,
   "dataformat_ohlcv": "feather",
   "initial_state": "running",
   "pairlists": [
