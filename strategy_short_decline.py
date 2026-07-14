@@ -88,6 +88,14 @@ class ShortDeclineStrategy(IStrategy):
     _first_entry_price: dict[str, float] = {}
     _first_entry_qty: dict[str, float] = {}  # 首次开仓的币数量（用于DCA保持相同数量）
     _lowest_price: dict[str, float] = {}  # 持仓期间最低价（用于移动止盈）
+
+    # ── 资金费率 ──
+    _funding_rate_cache: dict[
+        str, float
+    ] = {}  # pair -> 当前资金费率（如 -0.0005 = -0.05%）
+    _funding_watch_pairs: set[str] = set()  # 因资金费率过负被暂缓的交易对
+    _funding_rate_threshold = -0.0005  # 资金费率阈值 -0.05%
+
     _api_lock = threading.Lock()
     _last_api_fetch: float = 0
     _api_update_interval = 60
@@ -265,11 +273,89 @@ class ShortDeclineStrategy(IStrategy):
                         if self._is_eligible(perf_1w, perf_1m, perf_3m, chg_24h):
                             self._eligible_pairs.add(pair_key)
                     self._last_api_fetch = now
+
+            # ── 资金费率过滤 ──
+            self._fetch_funding_rates()
+            funding_blocked: set[str] = set()
+            for pair in list(self._eligible_pairs):
+                fr = self._funding_rate_cache.get(pair)
+                if fr is not None and fr < self._funding_rate_threshold:
+                    funding_blocked.add(pair)
+                    self._funding_watch_pairs.add(pair)
+                    logger.info(
+                        "[ShortDecline] %s 资金费率 %.6f < %.4f，暂缓开空（加入监控）",
+                        pair,
+                        fr,
+                        self._funding_rate_threshold,
+                    )
+            self._eligible_pairs -= funding_blocked
+
+            # ── 监控列表中恢复的交易对 ──
+            recovered: set[str] = set()
+            for pair in list(self._funding_watch_pairs):
+                fr = self._funding_rate_cache.get(pair)
+                if fr is not None and fr >= self._funding_rate_threshold:
+                    recovered.add(pair)
+                    # 重新检查是否还在扫描器结果中（仍然满足其他条件）
+                    if pair in self._eligible_pairs:
+                        logger.info(
+                            "[ShortDecline] %s 资金费率已恢复 %.6f，解除限制",
+                            pair,
+                            fr,
+                        )
+                    else:
+                        # 之前满足条件但因费率被拦，现在费率恢复，重新加入候选
+                        perf_1w = self._perf_1w_cache.get(pair)
+                        perf_1m = self._perf_1m_cache.get(pair)
+                        perf_3m = self._perf_3m_cache.get(pair)
+                        chg_24h = self._price_change_24h_cache.get(pair)
+                        if None not in (
+                            perf_1w,
+                            perf_1m,
+                            perf_3m,
+                            chg_24h,
+                        ) and self._is_eligible(perf_1w, perf_1m, perf_3m, chg_24h):
+                            self._eligible_pairs.add(pair)
+                            logger.info(
+                                "[ShortDecline] %s 资金费率已恢复 %.6f，重新加入候选",
+                                pair,
+                                fr,
+                            )
+            self._funding_watch_pairs -= recovered
         except Exception as e:
             print(f"[ShortDecline] 获取扫描器数据失败: {e}")
 
     def _norm_pair(self, pair: str) -> str:
         return pair.split(":")[0] if ":" in pair else pair
+
+    # ── 资金费率 ──
+
+    def _fetch_funding_rates(self) -> None:
+        """从币安 API 获取所有永续合约的当前资金费率。
+
+        接口: GET /fapi/v1/premiumIndex
+        返回示例: {"symbol":"BTCUSDT","lastFundingRate":"0.0001",...}
+        阈值 self._funding_rate_threshold = -0.0005 即 -0.05%
+        """
+        try:
+            resp = requests.get(
+                "https://fapi.binance.com/fapi/v1/premiumIndex", timeout=10
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                with self._api_lock:
+                    self._funding_rate_cache.clear()
+                    for item in data:
+                        symbol = item.get("symbol", "")
+                        rate = self._safe_float(item.get("lastFundingRate"))
+                        if symbol and rate is not None:
+                            for quote in ("USDT", "USDC", "BUSD"):
+                                if symbol.endswith(quote) and len(symbol) > len(quote):
+                                    pair = f"{symbol[: -len(quote)]}/{quote}"
+                                    self._funding_rate_cache[pair] = rate
+                                    break
+        except Exception as e:
+            print(f"[ShortDecline] 获取资金费率失败: {e}")
 
     # ── 入场 ──
 
@@ -474,4 +560,6 @@ class ShortDeclineStrategy(IStrategy):
             self._first_entry_price.pop(np, None)
             self._first_entry_qty.pop(np, None)
             self._lowest_price.pop(np, None)
+            self._funding_rate_cache.pop(np, None)
+            self._funding_watch_pairs.discard(np)
         return True
