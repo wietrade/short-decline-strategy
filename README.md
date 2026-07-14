@@ -40,7 +40,7 @@ strategy_short_decline.py  ── Freqtrade 纯做空 DCA 策略（ShortDeclineS
 | 环节 | 逻辑 |
 | :--- | :--- |
 | 数据源 | 每 60 秒轮询 `http://127.0.0.1:3001/api/list`，缓存 perf 与 24h 涨跌幅 |
-| 入场排除 | ① 24h 跌幅 > 10% 不做空；② `perf_1w/1m/3m − 24h涨幅` 任一 > 0 不做空 |
+| 入场排除 | ① 24h 跌幅 > 10% 不做空；② `perf_1w/1m/3m − 24h涨幅` 任一 > 0 不做空；③ 资金费率 < -0.05% 暂缓开空 |
 | 数据缺失保护 | 任一字段缺失（perf 或 24h）则该交易对不交易 |
 | 入场方向 | 通过筛选 → 做空（`enter_short`，tag=`short_decline`） |
 | ADX 排序 | 首次开仓按 ADX(14) 从高到低排队，只有候选中最高 ADX 才放行 |
@@ -52,6 +52,30 @@ strategy_short_decline.py  ── Freqtrade 纯做空 DCA 策略（ShortDeclineS
 **出场逻辑关键点**：`use_exit_signal = True` 是 `custom_exit` 被调用的**前提**。Freqtrade 源码中 `custom_exit` 的调用被包在 `if self.use_exit_signal:` 内，若设为 `False` 则出场逻辑完全失效（会导致盈利单永不平仓）。`populate_exit_trend` 不设任何信号，所有出场都在 `custom_exit` 中完成。
 
 **重启健壮性**：首仓价和币数量优先从 `trade.orders` 的真实成交入场订单恢复（`_get_first_entry_state`），内存缓存丢失（重启）也能正确管理已有持仓。
+
+### 资金费率过滤
+
+策略每 60 秒从币安 API（`fapi/v1/premiumIndex`）获取所有永续合约的实时资金费率，作为额外入场过滤：
+
+| 条件 | 行为 |
+|:---|:---|
+| 资金费率 < **-0.05%**（如 -0.1%） | 暂缓开空，交易对加入 **监控列表** |
+| 监控中的交易对费率恢复到 **≥ -0.05%** | 自动解除限制，重新加入开仓候选 |
+| 长期停留在监控列表中且已不在扫描结果中 | 自动清理（防内存泄漏） |
+
+阈值可在 `config_trade_surge.json` 中通过 `funding_rate_threshold` 参数调整，默认 `-0.0005`（即 -0.05%）。
+
+**筛选流程：**
+
+```
+扫描器数据 → 原有筛选(perf+ADX) → 资金费率检查 → 最终候选列表
+                                        │
+                                  费率 < -0.05%?
+                                   ├─ 是 → 加入监控列表，暂缓开空
+                                   └─ 否 → 正常加入候选
+                                 每次循环检查监控列表
+                                   └─ 费率已恢复 → 重新进入候选
+```
 
 ### DCA 加仓间隔（斐波那契递增）
 
@@ -187,6 +211,7 @@ tail -f /tmp/ft.log           # 查看日志
 | 模拟资金 | 2000 USDT | `dry_run_wallet` |
 | 单笔保证金 | 100 USDT | 由策略 `custom_stake_amount` 控制 |
 | 杠杆 | 10x | `futures_leverage` |
+| 资金费率阈值 | -0.05% (= -0.0005) | `funding_rate_threshold`，策略自动过滤 |
 | 最大持仓 | 10 | `max_open_trades` |
 | 保证金模式 | cross | 全仓 |
 | 入场/退出价侧 | other | 吃对手盘 |
