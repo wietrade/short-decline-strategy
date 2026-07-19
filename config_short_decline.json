@@ -48,15 +48,26 @@
         "defaultType": "swap"
       }
     },
-    "pair_whitelist": [],
-    "fee": 0.0005
+    "ccxt_async_config": {
+      "options": {
+        "defaultType": "swap"
+      }
+    }
+  },
+  "pairlist_method": ["StaticPairList"],
+  "telegram": {
+    "enabled": false,
+    "token": "",
+    "chat_id": ""
   },
   "api_server": {
     "enabled": true,
     "listen_ip_address": "0.0.0.0",
-    "listen_port": 8000,
+    "listen_port": 8001,
     "username": "admin",
     "password": "admin123",
-    "jwt_secret_key": "VolumeSurgeSecretKey2024!"
-  }
+    "jwt_secret_key": "ShortDeclineSecretKey2024!"
+  },
+  "db_url": "sqlite:///tradesv3_short.sqlite",
+  "logfile": "logs/short_decline.log"
 }

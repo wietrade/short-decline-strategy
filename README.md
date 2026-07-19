@@ -32,6 +32,7 @@ strategy_short_decline.py  ── Freqtrade 纯做空 DCA 策略（ShortDeclineS
 | HTTP 健壮性 | `ThreadingHTTPServer` + `close_connection=True` + 10s 超时，防 socket 泄漏 |
 | 优雅退出 | 捕获 SIGINT/SIGTERM，`_running=False` 后关闭 HTTP 服务 |
 | 运行方式 | 服务器上用 screen 守护 |
+| 24h 涨幅过滤 | `MIN_CHG24_PCT = 5.0`，`/api/pairlist` 中过滤掉涨幅不足的交易对 |
 
 ### 2. 策略 `strategy_short_decline.py`（ShortDeclineStrategy）
 
@@ -46,7 +47,7 @@ strategy_short_decline.py  ── Freqtrade 纯做空 DCA 策略（ShortDeclineS
 | ADX 排序 | 首次开仓按 ADX(14) 从高到低排队，只有候选中最高 ADX 才放行 |
 | 开仓 | 100U 保证金 × 10x 杠杆 = 1000U 名义；记录首仓价与币数量 |
 | DCA 加仓 | 逆势上涨触发，间隔按斐波那契数列递增，币数量与首仓相同，最多 5 次 |
-| 出场 | 基于加权持仓均价 `trade.open_rate` 做移动止盈（激活 15%、回撤 5%） |
+| 出场 | 基于加权持仓均价 `trade.open_rate` 做移动止盈（激活 **6%**、回撤 **3%**） |
 | 止损 | `custom_stoploss` 返回 -10.0（1000%），等效不止损 |
 
 **出场逻辑关键点**：`use_exit_signal = True` 是 `custom_exit` 被调用的**前提**。Freqtrade 源码中 `custom_exit` 的调用被包在 `if self.use_exit_signal:` 内，若设为 `False` 则出场逻辑完全失效（会导致盈利单永不平仓）。`populate_exit_trend` 不设任何信号，所有出场都在 `custom_exit` 中完成。
@@ -58,12 +59,12 @@ strategy_short_decline.py  ── Freqtrade 纯做空 DCA 策略（ShortDeclineS
 策略每 60 秒从币安 API（`fapi/v1/premiumIndex`）获取所有永续合约的实时资金费率，作为额外入场过滤：
 
 | 条件 | 行为 |
-|:---|:---|
+| :--- | :--- |
 | 资金费率 < **-0.05%**（如 -0.1%） | 暂缓开空，交易对加入 **监控列表** |
-| 监控中的交易对费率恢复到 **≥ -0.05%** | 自动解除限制，重新加入开仓候选 |
+| 监控中的交易对费率恢复到 **≥ -0.05%** | 还需检查 24h 涨幅 ≥ 5%，**两者都满足**才恢复入场 |
 | 长期停留在监控列表中且已不在扫描结果中 | 自动清理（防内存泄漏） |
 
-阈值在策略代码中通过 `funding_rate_threshold` 定义，默认 `-0.005`（即 -0.5%）。
+阈值在策略代码中通过 `funding_rate_threshold` 定义，默认 `-0.0005`（即 -0.05%）。
 
 **筛选流程：**
 
@@ -96,7 +97,7 @@ trigger(n) = Σ gap_i (i=1..n)
 
 ### 移动止盈（固定参数）
 
-移动止盈从加权持仓均价 `trade.open_rate` 开始计算。策略记录持仓期间最低价；当价格向盈利方向从均价下跌 **15%** 以上（激活移动止盈），再从最低点反弹 **5%** 以上时平仓。
+移动止盈从加权持仓均价 `trade.open_rate` 开始计算。策略记录持仓期间最低价；当价格向盈利方向从均价下跌 **6%** 以上（激活移动止盈），再从最低点反弹 **3%** 以上时平仓。
 
 平仓还有一道硬条件：当前必须仍是盈利状态。也就是空单当前价仍低于加权持仓均价，且 `current_profit > 0`。如果价格已经反弹到均价上方，即使历史最低价曾经触发过激活，也不会按止盈平仓。
 
@@ -124,15 +125,16 @@ trigger(n) = Σ gap_i (i=1..n)
 | SSH | `ssh -i "43.165.167.132_id_ed25519" root@43.165.167.132` |
 | 公网入口 | [https://bot2.1230sb.com](https://bot2.1230sb.com)（Nginx 反代 `127.0.0.1:3001`） |
 | 策略路径 | `/www/wwwroot/freqtrade/user_data/strategies/strategy_short_decline.py` |
-| 配置路径 | `/www/wwwroot/freqtrade/user_data/config_trade_surge.json` |
-| 交易数据库 | `/www/wwwroot/freqtrade/tradesv3.dryrun.sqlite` |
+| 配置路径 | `/www/wwwroot/freqtrade/user_data/config_short_decline.json` |
+| 交易数据库 | `/www/wwwroot/freqtrade/tradesv3_short.sqlite` |
+| 日志 | `/tmp/ft_short.log` |
 
 ### 端口
 
 | 服务 | 端口 | 说明 |
 | :--- | :---: | :--- |
 | 扫描程序 API | 3001 | HTTP（仅本机，Nginx 反代到公网） |
-| Freqtrade API | 8000 | REST API + WebSocket |
+| Freqtrade API | 8001 | REST API + WebSocket |
 
 ---
 
@@ -162,6 +164,8 @@ trigger(n) = Σ gap_i (i=1..n)
 
 含 `entry_time`/`exit_time`/`rating_text` 等字段，供浏览器渲染看板。
 
+
+
 ---
 
 ## 部署
@@ -178,32 +182,30 @@ screen -S screener -X quit    # 停止
 ps aux | grep tv_binance | grep -v grep
 ```
 
-### Freqtrade（setsid 脱离会话）
+### Freqtrade
 
 ```bash
 cd /www/wwwroot/freqtrade
 
-# 停止旧进程（交互式 SSH 中执行；不要嵌在同一条远程启动命令里）
-pkill -9 -f "[f]reqtrade trade"
+# 停止旧进程
+pkill -9 -f "[f]reqtrade.*ShortDecline"
 
-# 后台启动（setsid 确保脱离 SSH 会话，不随连接断开退出）
-setsid bash -c '.venv/bin/freqtrade trade \
+# 后台启动
+nohup .venv/bin/freqtrade trade \
   --strategy ShortDeclineStrategy \
   --userdir user_data \
-  -c user_data/config_trade_surge.json > /tmp/ft.log 2>&1' < /dev/null &
+  -c user_data/config_short_decline.json > /tmp/ft_short.log 2>&1 &
 
 # 管理
-pgrep -af "[f]reqtrade trade" # 查看进程
-tail -f /tmp/ft.log           # 查看日志
+pgrep -af "[f]reqtrade.*ShortDecline"  # 查看进程
+tail -f /tmp/ft_short.log              # 查看日志
 ```
 
-> ⚠️ 用 `nohup ... &` 直接跟在 SSH 命令后可能随会话退出被杀，务必用 `setsid`。
-> ⚠️ 在 Windows PowerShell 里把 `pkill -f "freqtrade trade"` 和启动命令塞进同一条 SSH 命令，可能误杀当前远程 shell。建议分步执行，或用 `[f]reqtrade trade` 这种不会自匹配的模式查看进程。
-> 更换策略或清空模拟盘时：`rm -f /www/wwwroot/freqtrade/tradesv3.dryrun.sqlite*`
+> ⚠️ 更换策略或清空模拟盘时：`rm -f /www/wwwroot/freqtrade/tradesv3_short.sqlite*`
 
 ---
 
-## 配置 `config_trade_surge.json`
+## 配置 `config_short_decline.json`
 
 | 参数 | 值 | 说明 |
 | :--- | :---: | :--- |
@@ -233,7 +235,7 @@ tail -f /tmp/ft.log           # 查看日志
 i:\1H\
 ├── tv_binance_volume_screener.py    # 成交量异动扫描程序
 ├── strategy_short_decline.py        # Freqtrade 纯做空 DCA 策略
-├── config_trade_surge.json          # Freqtrade 交易配置
+├── config_short_decline.json        # Freqtrade 交易配置
 ├── 43.165.167.132_id_ed25519        # SSH 密钥
 ├── requirements.txt                 # Python 依赖
 ├── data/

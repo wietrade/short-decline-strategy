@@ -71,8 +71,8 @@ class ShortDeclineStrategy(IStrategy):
     short_add_threshold = 0.10  # 斐波那契基准间隔（相对首仓价）
 
     # ── 移动止盈参数（相对加权均价） ──
-    trail_activate = 0.15  # 价格低于均价 15% 激活移动止盈
-    trail_pullback = 0.05  # 从持仓最低价反弹 5% 平仓
+    trail_activate = 0.06  # 价格低于均价 6% 激活移动止盈
+    trail_pullback = 0.03  # 从持仓最低价反弹 3% 平仓
 
     # ── ADX 排序（仅用于入场优先级）──
     adx_period = 14
@@ -94,7 +94,9 @@ class ShortDeclineStrategy(IStrategy):
         str, float
     ] = {}  # pair -> 当前资金费率（如 -0.005 = -0.5%）
     _funding_watch_pairs: set[str] = set()  # 因资金费率过负被暂缓的交易对
-    funding_rate_threshold = -0.005  # 资金费率阈值 -0.5%，仅由策略代码定义
+    funding_rate_threshold = (
+        -0.0005
+    )  # 资金费率阈值 -0.05%，低于此值禁止开空（山寨币急拉时空头付钱）
 
     _api_lock = threading.Lock()
     _last_api_fetch: float = 0
@@ -298,7 +300,7 @@ class ShortDeclineStrategy(IStrategy):
                     )
             self._eligible_pairs -= funding_blocked
 
-            # ── 监控列表中恢复的交易对 ──
+            # ── 监控列表中恢复的交易对（_is_eligible 包含所有条件检查） ──
             recovered: set[str] = set()
             for pair in list(self._funding_watch_pairs):
                 fr = self._funding_rate_cache.get(pair)
@@ -337,6 +339,7 @@ class ShortDeclineStrategy(IStrategy):
             if stale_watch:
                 logger.info("[ShortDecline] 清理僵尸监控 %s", stale_watch)
                 self._funding_watch_pairs -= stale_watch
+
         except Exception as e:
             print(f"[ShortDecline] 获取扫描器数据失败: {e}")
 
@@ -350,7 +353,7 @@ class ShortDeclineStrategy(IStrategy):
 
         接口: GET /fapi/v1/premiumIndex
         返回示例: {"symbol":"BTCUSDT","lastFundingRate":"0.0001",...}
-        阈值 funding_rate_threshold = -0.005 即 -0.5%，策略代码中定义
+        阈值 funding_rate_threshold = -0.0005 即 -0.05%，策略代码中定义
         """
         try:
             resp = requests.get(
@@ -542,6 +545,10 @@ class ShortDeclineStrategy(IStrategy):
             return None
         price_rise = (current_rate - first_entry) / first_entry
         if price_rise >= self._dca_trigger_rise(count + 1):
+            # 加仓前重置移动止盈最低点：以当前价为新起点重新追踪
+            np = self._norm_pair(trade.pair)
+            with self._api_lock:
+                self._lowest_price[np] = current_rate
             # 加仓数量与首次相同：保证金 = 数量 × 当前价 / 杠杆
             leverage = float(self.config.get("futures_leverage", 10))
             return round(first_qty * current_rate / leverage, 2)
