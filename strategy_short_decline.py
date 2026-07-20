@@ -155,9 +155,9 @@ class ShortDeclineStrategy(IStrategy):
     ] = {}  # pair -> 当前资金费率（如 -0.005 = -0.5%）
     _funding_watch_pairs: set[str] = set()  # 因资金费率过负被暂缓的交易对
     funding_rate_threshold = (
-        -0.001
-    )  # 资金费率阈值 -0.1%，低于此值禁止开空（山寨币急拉时空头付钱）
-    funding_flip_threshold = -0.001  # 资金费率 < -0.1% 时空仓立即平仓转多
+        -0.0001
+    )  # 资金费率阈值 -0.01%，低于此值禁止开空（山寨币急拉时空头付钱）
+    funding_flip_threshold = -0.0001  # 资金费率 < -0.01% 时空仓立即平仓转多
 
     _api_lock = threading.Lock()
     _last_api_fetch: float = 0
