@@ -226,7 +226,8 @@ class ShortDeclineStrategy(IStrategy):
     def _is_eligible(
         perf_1w: float, perf_1m: float, perf_3m: float, chg_24h: float
     ) -> bool:
-        if chg_24h < -10:
+        # 24h 涨幅必须 > 0（确认短期上涨趋势）
+        if chg_24h <= 0:
             return False
         return all((value - chg_24h) <= 0 for value in (perf_1w, perf_1m, perf_3m))
 
