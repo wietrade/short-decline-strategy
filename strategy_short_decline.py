@@ -90,6 +90,7 @@ class ShortDeclineStrategy(IStrategy):
     _perf_1m_cache: dict[str, float] = {}
     _perf_3m_cache: dict[str, float] = {}
     _price_change_24h_cache: dict[str, float] = {}
+    _price_change_4h_cache: dict[str, float] = {}
     _eligible_pairs: set[str] = set()
     _first_entry_price: dict[str, float] = {}
     _first_entry_qty: dict[str, float] = {}  # 首次开仓的币数量（用于DCA保持相同数量）
@@ -224,11 +225,15 @@ class ShortDeclineStrategy(IStrategy):
 
     @staticmethod
     def _is_eligible(
-        perf_1w: float, perf_1m: float, perf_3m: float, chg_24h: float
+        perf_1w: float, perf_1m: float, perf_3m: float, chg_4h: float, chg_24h: float
     ) -> bool:
-        # 24h 涨幅必须 > 0（确认短期上涨趋势）
+        # 4h 涨幅 ≥ 8%（确认短期拉盘强度）
+        if chg_4h < 8:
+            return False
+        # 24h 涨幅 > 0（确认上涨方向）
         if chg_24h <= 0:
             return False
+        # 1w/1m/3m 涨幅 ≤ 24h 涨幅（说明近期才开始涨）
         return all((value - chg_24h) <= 0 for value in (perf_1w, perf_1m, perf_3m))
 
     def _dca_trigger_rise(self, n: int) -> float:
@@ -258,8 +263,7 @@ class ShortDeclineStrategy(IStrategy):
                     self._perf_1m_cache.clear()
                     self._perf_3m_cache.clear()
                     self._price_change_24h_cache.clear()
-                    self._high_24h_cache.clear()
-                    self._pair_price_cache.clear()
+                    self._price_change_4h_cache.clear()
                     self._eligible_pairs.clear()
                     for r in results:
                         name = r.get("name") or r.get("pair", "")
@@ -287,13 +291,15 @@ class ShortDeclineStrategy(IStrategy):
                         perf_1m = self._safe_float(r.get("perf_1m"))
                         perf_3m = self._safe_float(r.get("perf_3m"))
                         chg_24h = self._safe_float(r.get("price_change_24h_pct"))
-                        if None in (perf_1w, perf_1m, perf_3m, chg_24h):
+                        chg_4h = self._safe_float(r.get("price_change_4h_pct"))
+                        if None in (perf_1w, perf_1m, perf_3m, chg_24h, chg_4h):
                             continue
                         self._perf_1w_cache[pair_key] = perf_1w
                         self._perf_1m_cache[pair_key] = perf_1m
                         self._perf_3m_cache[pair_key] = perf_3m
                         self._price_change_24h_cache[pair_key] = chg_24h
-                        if self._is_eligible(perf_1w, perf_1m, perf_3m, chg_24h):
+                        self._price_change_4h_cache[pair_key] = chg_4h
+                        if self._is_eligible(perf_1w, perf_1m, perf_3m, chg_4h, chg_24h):
                             self._eligible_pairs.add(pair_key)
                     self._last_api_fetch = now
 
@@ -324,12 +330,14 @@ class ShortDeclineStrategy(IStrategy):
                     perf_1m = self._perf_1m_cache.get(pair)
                     perf_3m = self._perf_3m_cache.get(pair)
                     chg_24h = self._price_change_24h_cache.get(pair)
+                    chg_4h = self._price_change_4h_cache.get(pair)
                     if None not in (
                         perf_1w,
                         perf_1m,
                         perf_3m,
                         chg_24h,
-                    ) and self._is_eligible(perf_1w, perf_1m, perf_3m, chg_24h):
+                        chg_4h,
+                    ) and self._is_eligible(perf_1w, perf_1m, perf_3m, chg_4h, chg_24h):
                         self._eligible_pairs.add(pair)
                         logger.info(
                             "[ShortDecline] %s 资金费率已恢复 %.6f，重新加入候选",
