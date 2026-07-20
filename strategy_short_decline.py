@@ -103,6 +103,51 @@ class ShortDeclineStrategy(IStrategy):
     # 多头止损冷却期（秒），防止反复翻转
     _long_cooldown_until: dict[str, float] = {}
     long_cooldown_seconds = 3600  # 多头止损后 1 小时内不重新开空
+    _flip_state_file = "user_data/flip_state.json"  # 持久化翻转状态（重启不丢失）
+
+    # ── 翻转状态持久化 ──
+
+    def _save_flip_state(self) -> None:
+        import json
+
+        try:
+            with self._api_lock:
+                data = {
+                    "flip_to_long": self._flip_to_long,
+                    "long_cooldown_until": self._long_cooldown_until,
+                }
+            with open(self._flip_state_file, "w") as f:
+                json.dump(data, f, default=str)
+        except Exception as e:
+            logger.warning("[ShortDecline] 保存翻转状态失败: %s", e)
+
+    def _load_flip_state(self) -> None:
+        import json
+        import os
+
+        try:
+            if not os.path.exists(self._flip_state_file):
+                return
+            with open(self._flip_state_file, "r") as f:
+                data = json.load(f)
+            with self._api_lock:
+                self._flip_to_long = data.get("flip_to_long", {})
+                self._long_cooldown_until = data.get("long_cooldown_until", {})
+            # 清理过期的冷却期
+            now = time.time()
+            expired = [p for p, t in self._long_cooldown_until.items() if now >= t]
+            for p in expired:
+                self._long_cooldown_until.pop(p, None)
+                self._flip_to_long.pop(p, None)
+            if expired:
+                self._save_flip_state()
+            logger.info(
+                "[ShortDecline] 已加载翻转状态: flip=%d, cooldown=%d",
+                len(self._flip_to_long),
+                len(self._long_cooldown_until),
+            )
+        except Exception as e:
+            logger.warning("[ShortDecline] 加载翻转状态失败: %s", e)
 
     # ── 资金费率 ──
     _funding_rate_cache: dict[
@@ -119,6 +164,10 @@ class ShortDeclineStrategy(IStrategy):
     _data_stale_timeout = 300  # 数据过期阈值（秒），超时后暂停开仓
 
     # ── 指标 ──
+
+    def bot_start(self, **kwargs) -> None:
+        """策略启动时从文件恢复翻转状态"""
+        self._load_flip_state()
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         # ADX 仅用于入场优先级排序，不做过滤
@@ -299,7 +348,9 @@ class ShortDeclineStrategy(IStrategy):
                         self._perf_3m_cache[pair_key] = perf_3m
                         self._price_change_24h_cache[pair_key] = chg_24h
                         self._price_change_4h_cache[pair_key] = chg_4h
-                        if self._is_eligible(perf_1w, perf_1m, perf_3m, chg_4h, chg_24h):
+                        if self._is_eligible(
+                            perf_1w, perf_1m, perf_3m, chg_4h, chg_24h
+                        ):
                             self._eligible_pairs.add(pair_key)
                     self._last_api_fetch = now
 
@@ -715,6 +766,7 @@ class ShortDeclineStrategy(IStrategy):
                     "stop_out_time": current_time.isoformat(),
                     "short_qty": first_qty,
                 }
+            self._save_flip_state()
             logger.info(
                 "[ShortDecline] %s 空头止损 @%.6f → 触发多头反转 (数量=%.4f)",
                 pair,
@@ -727,6 +779,7 @@ class ShortDeclineStrategy(IStrategy):
             with self._api_lock:
                 self._flip_to_long.pop(np, None)
                 self._long_cooldown_until[np] = time.time() + self.long_cooldown_seconds
+            self._save_flip_state()
             logger.info(
                 "[ShortDecline] %s 多头止损 @%.6f → 回到空头模式 (冷却%ds)",
                 pair,
@@ -738,6 +791,7 @@ class ShortDeclineStrategy(IStrategy):
         if not trade.is_short and "stop_loss" not in exit_reason:
             with self._api_lock:
                 self._flip_to_long.pop(np, None)
+            self._save_flip_state()
             logger.info("[ShortDecline] %s 多头止盈 @%.6f → 回到空头模式", pair, rate)
 
         # 清理缓存
