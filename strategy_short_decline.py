@@ -442,12 +442,25 @@ class ShortDeclineStrategy(IStrategy):
             return dataframe
 
         # ── 24h 最高价突破：当前价格必须高于过去24h最高价才允许开空 ──
+        # 取过去96根已完成K线（不含当前K线），当前close突破该高点即开空
         lookback = 96  # 24h / 15min = 96 根K线
-        if len(dataframe) >= lookback:
-            high_24h = dataframe["high"].iloc[-lookback:].max()
+        if len(dataframe) >= lookback + 1:
+            high_24h = dataframe["high"].iloc[-(lookback + 1) : -1].max()
             current_close = dataframe["close"].iloc[-1]
             if current_close <= high_24h:
+                logger.debug(
+                    "[ShortDecline] %s 当前价=%.6f ≤ 24h最高价=%.6f，未突破，跳过",
+                    pair,
+                    current_close,
+                    high_24h,
+                )
                 return dataframe
+            logger.info(
+                "[ShortDecline] %s 当前价=%.6f > 24h最高价=%.6f，突破确认，开空",
+                pair,
+                current_close,
+                high_24h,
+            )
 
         dataframe.loc[dataframe["volume"] > 0, ["enter_short", "enter_tag"]] = (
             1,
