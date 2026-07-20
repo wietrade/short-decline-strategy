@@ -187,6 +187,7 @@ class VolumeSurgeHandler(BaseHTTPRequestHandler):
                     {
                         "pair": pair,
                         "price": r.get("price"),
+                        "high_24h": r.get("high_24h"),
                         "vol_24h": r.get("vol_24h"),
                         "vol_change_24h_pct": r.get("vol_change_24h_pct"),
                         "price_change_24h_pct": r.get("price_change_24h_pct"),
@@ -938,6 +939,7 @@ def get_binance_perpetual_volume_surge(
         "columns": [
             "name",
             "close",
+            "high",
             "type",
             "exchange",
             "24h_vol_change|5",
@@ -1007,27 +1009,28 @@ def get_binance_perpetual_volume_surge(
                     "symbol": item.get("s", ""),
                     "name": d[0] or "",
                     "price": _to_float_or_none(d[1]),
-                    "type": d[2] or "",
-                    "exchange": d[3] or "",
-                    "vol_change_24h_pct": _to_float_or_none(d[4]),
-                    "vol_24h": _to_float_or_none(d[5]),
-                    "price_change_24h_pct": _to_float_or_none(d[6])
-                    if len(d) > 6
+                    "high_24h": _to_float_or_none(d[2]),
+                    "type": d[3] or "",
+                    "exchange": d[4] or "",
+                    "vol_change_24h_pct": _to_float_or_none(d[5]),
+                    "vol_24h": _to_float_or_none(d[6]),
+                    "price_change_24h_pct": _to_float_or_none(d[7])
+                    if len(d) > 7
                     else None,
                     "price_change_4h_pct": (
-                        (_to_float_or_none(d[7]) / _to_float_or_none(d[1]) * 100)
-                        if len(d) > 7 and _to_float_or_none(d[1])
+                        (_to_float_or_none(d[8]) / _to_float_or_none(d[1]) * 100)
+                        if len(d) > 8 and _to_float_or_none(d[1])
                         else None
                     ),
-                    "currency": d[8] if len(d) > 8 else None,
-                    "recommend_all": _to_float_or_none(d[9]) if len(d) > 9 else None,
-                    "recommend_ma": _to_float_or_none(d[10]) if len(d) > 10 else None,
-                    "recommend_other": _to_float_or_none(d[11])
-                    if len(d) > 11
+                    "currency": d[9] if len(d) > 9 else None,
+                    "recommend_all": _to_float_or_none(d[10]) if len(d) > 10 else None,
+                    "recommend_ma": _to_float_or_none(d[11]) if len(d) > 11 else None,
+                    "recommend_other": _to_float_or_none(d[12])
+                    if len(d) > 12
                     else None,
-                    "perf_1w": _to_float_or_none(d[12]) if len(d) > 12 else None,
-                    "perf_1m": _to_float_or_none(d[13]) if len(d) > 13 else None,
-                    "perf_3m": _to_float_or_none(d[14]) if len(d) > 14 else None,
+                    "perf_1w": _to_float_or_none(d[13]) if len(d) > 13 else None,
+                    "perf_1m": _to_float_or_none(d[14]) if len(d) > 14 else None,
+                    "perf_3m": _to_float_or_none(d[15]) if len(d) > 15 else None,
                 }
             )
         except (IndexError, KeyError, TypeError, ValueError):
