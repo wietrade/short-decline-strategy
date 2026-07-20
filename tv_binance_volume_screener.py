@@ -34,13 +34,13 @@ import requests
 # 配置
 # ═══════════════════════════════════════════════
 MIN_VOL_CHANGE_PCT = 500  # 24h 成交量变化最小百分比
-MIN_CHG24_PCT = 5.0  # 24h 涨幅最小百分比（低于此值不出现在 pairlist 中）
+MIN_CHG4H_PCT = 8.0  # 4h 涨幅最小百分比（低于此值不出现在 pairlist 中）
 MAX_RESULTS = 200  # 最大结果数
 INTERVAL_SECONDS = 60  # 更新间隔（秒），60 = 1分钟
 DB_PATH = Path(__file__).parent / "data" / "volume_surge.db"
 HTTP_HOST = "127.0.0.1"  # 仅本机监听，由 Nginx 反代到公网域名
 HTTP_PORT = 3001  # HTTP 服务器端口
-MAX_DISPLAY_RESULTS = 30  # 最多显示记录数
+MAX_DISPLAY_RESULTS = 50  # 最多显示记录数
 MAX_HISTORY_RECORDS = 50  # 数据库最多保留记录数
 ACTIVE_DURATION_MINUTES = 30  # 交易对在 pairlist 中最长保留时间（分钟）
 HTTP_REQUEST_TIMEOUT = 10  # 防止半开连接阻塞 HTTP 线程
@@ -190,6 +190,7 @@ class VolumeSurgeHandler(BaseHTTPRequestHandler):
                         "vol_24h": r.get("vol_24h"),
                         "vol_change_24h_pct": r.get("vol_change_24h_pct"),
                         "price_change_24h_pct": r.get("price_change_24h_pct"),
+                        "price_change_4h_pct": r.get("price_change_4h_pct"),
                         "perf_1w": r.get("perf_1w"),
                         "perf_1m": r.get("perf_1m"),
                         "perf_3m": r.get("perf_3m"),
@@ -210,16 +211,16 @@ class VolumeSurgeHandler(BaseHTTPRequestHandler):
         /api/pairlist - 返回当前所有交易对（按成交量降序），供 Freqtrade RemotePairList 使用。
         Binance 合约 (swap) 格式需要 ":USDT" 后缀才能被 expand_pairlist 匹配。
         返回格式: {"pairs": ["SAFE/USDT:USDT", "ME/USDT:USDT", ...], "refresh_period": 60}
-        过滤条件: 24h 涨幅 < MIN_CHG24_PCT 的交易对不进入 pairlist。
+        过滤条件: 4h 涨幅 < MIN_CHG4H_PCT 的交易对不进入 pairlist。
         """
         with G.lock:
             items = []
             for r in G.latest_active_scan:
-                chg24 = r.get("price_change_24h_pct")
-                if chg24 is None or chg24 == "":
+                chg4h = r.get("price_change_4h_pct")
+                if chg4h is None or chg4h == "":
                     continue
                 try:
-                    if float(chg24) < MIN_CHG24_PCT:
+                    if float(chg4h) < MIN_CHG4H_PCT:
                         continue
                 except (TypeError, ValueError):
                     continue
@@ -942,6 +943,7 @@ def get_binance_perpetual_volume_surge(
             "24h_vol_change|5",
             "24h_vol|5",
             "24h_close_change|5",
+            "change|240",
             "currency",
             "Recommend.All|15",
             "Recommend.MA|15",
@@ -1012,15 +1014,20 @@ def get_binance_perpetual_volume_surge(
                     "price_change_24h_pct": _to_float_or_none(d[6])
                     if len(d) > 6
                     else None,
-                    "currency": d[7] if len(d) > 7 else None,
-                    "recommend_all": _to_float_or_none(d[8]) if len(d) > 8 else None,
-                    "recommend_ma": _to_float_or_none(d[9]) if len(d) > 9 else None,
-                    "recommend_other": _to_float_or_none(d[10])
-                    if len(d) > 10
+                    "price_change_4h_pct": (
+                        (_to_float_or_none(d[7]) / _to_float_or_none(d[1]) * 100)
+                        if len(d) > 7 and _to_float_or_none(d[1])
+                        else None
+                    ),
+                    "currency": d[8] if len(d) > 8 else None,
+                    "recommend_all": _to_float_or_none(d[9]) if len(d) > 9 else None,
+                    "recommend_ma": _to_float_or_none(d[10]) if len(d) > 10 else None,
+                    "recommend_other": _to_float_or_none(d[11])
+                    if len(d) > 11
                     else None,
-                    "perf_1w": _to_float_or_none(d[11]) if len(d) > 11 else None,
-                    "perf_1m": _to_float_or_none(d[12]) if len(d) > 12 else None,
-                    "perf_3m": _to_float_or_none(d[13]) if len(d) > 13 else None,
+                    "perf_1w": _to_float_or_none(d[12]) if len(d) > 12 else None,
+                    "perf_1m": _to_float_or_none(d[13]) if len(d) > 13 else None,
+                    "perf_3m": _to_float_or_none(d[14]) if len(d) > 14 else None,
                 }
             )
         except (IndexError, KeyError, TypeError, ValueError):

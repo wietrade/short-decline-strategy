@@ -25,7 +25,7 @@ strategy_short_decline.py  ── Freqtrade 纯做空 DCA 策略（ShortDeclineS
 
 | 特性 | 说明 |
 | :--- | :--- |
-| 活跃窗口 | 交易对首次出现后保留 **30 分钟**（`ACTIVE_DURATION_MINUTES`），超时移出 pairlist |
+| 活跃窗口 | `ACTIVE_DURATION_MINUTES` = 30，仅用于看板 **NEW 标记**（30分钟内新增显示绿色竖条），不参与 pairlist 过滤 |
 | 重新激活 | 退出后再次满足条件，`entry_time` 重置，重新获得 30 分钟窗口 |
 | 数据清洗 | 数值字段经 `_to_float_or_none()` 处理 → `float \| null` |
 | 历史记录 | SQLite（`data/volume_surge.db`），最多保留 50 条 |
@@ -224,7 +224,7 @@ tail -f /tmp/ft_short.log              # 查看日志
 | :--- | :---: | :--- |
 | `MIN_VOL_CHANGE_PCT` | 500 | 24h 成交量变化最小百分比 |
 | `INTERVAL_SECONDS` | 60 | 轮询间隔（秒） |
-| `ACTIVE_DURATION_MINUTES` | 30 | 交易对在 pairlist 中最长保留时间 |
+| `ACTIVE_DURATION_MINUTES` | 30 | 看板 NEW 标记阈值（非 pairlist 过滤） |
 | `MAX_HISTORY_RECORDS` | 50 | 数据库最多保留记录数 |
 
 ---

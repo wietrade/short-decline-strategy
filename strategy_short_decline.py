@@ -74,6 +74,9 @@ class ShortDeclineStrategy(IStrategy):
     trail_activate = 0.06  # 价格低于均价 6% 激活移动止盈
     trail_pullback = 0.03  # 从持仓最低价反弹 3% 平仓
 
+    # ── 持仓超时平仓 ──
+    max_hold_hours = 18  # 持仓超过此时间后，价格回到成本价即平仓
+
     # ── ADX 排序（仅用于入场优先级）──
     adx_period = 14
     _adx_cache: dict[str, float] = {}
@@ -101,6 +104,7 @@ class ShortDeclineStrategy(IStrategy):
     _api_lock = threading.Lock()
     _last_api_fetch: float = 0
     _api_update_interval = 60
+    _data_stale_timeout = 300  # 数据过期阈值（秒），超时后暂停开仓
 
     # ── 指标 ──
 
@@ -218,18 +222,14 @@ class ShortDeclineStrategy(IStrategy):
     def _dca_trigger_rise(self, n: int) -> float:
         """第 n 次加仓（n>=1）需要的累计涨幅（相对首仓价）。
 
-        间隔按斐波那契数列递增（前期密集、后期稀疏）：
-          fib      = 1, 1, 2, 3, 5, 8, ...
-          gap_i    = short_add_threshold * fib(i)
-          trigger(n) = Σ gap_i (i=1..n) = base * Σ fib(i)
-        以 base=10% 为例：累计触发 = 10% / 20% / 40% / 70% / 120% / ...
+        间隔递增（base=10%）：
+          n=1: 10% / n=2: 20% / n=3: 50% / n=4: 100% / n=5: 200%
         """
-        base = self.short_add_threshold
-        a, b, fib_sum = 1, 1, 0
-        for _ in range(n):
-            fib_sum += a
-            a, b = b, a + b
-        return base * fib_sum
+        triggers = [0.10, 0.20, 0.50, 1.00, 2.00]
+        if 1 <= n <= len(triggers):
+            return triggers[n - 1]
+        # 超出范围继续按 2× 翻倍
+        return 2.00 * (2 ** (n - 5))
 
     def _fetch_perf_data(self) -> None:
         now = time.time()
@@ -343,6 +343,14 @@ class ShortDeclineStrategy(IStrategy):
         except Exception as e:
             print(f"[ShortDecline] 获取扫描器数据失败: {e}")
 
+    def _is_data_stale(self) -> bool:
+        """扫描器数据是否过期（超过 _data_stale_timeout 秒未成功更新）。"""
+        with self._api_lock:
+            last = self._last_api_fetch
+        if last == 0:
+            return True  # 从未成功拉取过
+        return (time.time() - last) > self._data_stale_timeout
+
     def _norm_pair(self, pair: str) -> str:
         return pair.split(":")[0] if ":" in pair else pair
 
@@ -379,6 +387,9 @@ class ShortDeclineStrategy(IStrategy):
 
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         pair = self._norm_pair(metadata.get("pair", ""))
+        # 数据过期保护：扫描器数据太久未更新则暂停开仓
+        if self._is_data_stale():
+            return dataframe
         with self._api_lock:
             perf_1w = self._perf_1w_cache.get(pair)
             perf_1m = self._perf_1m_cache.get(pair)
@@ -445,6 +456,24 @@ class ShortDeclineStrategy(IStrategy):
             if mem_low is not None:
                 low = min(low, mem_low)
             self._lowest_price[np] = low
+
+        # ── 持仓超时平仓：超过 max_hold_hours 小时后，价格回到成本价则退出 ──
+        open_dt = trade.open_date_utc
+        if open_dt is not None:
+            hours = (
+                current_time.replace(tzinfo=open_dt.tzinfo) - open_dt
+            ).total_seconds() / 3600
+            if hours >= self.max_hold_hours and current_profit >= 0:
+                logger.info(
+                    "[ShortDecline] %s 持仓 %.1f小时(≥%d) 成本价=%.6f 现价=%.6f profit=%.3f 超时平仓",
+                    trade.pair,
+                    hours,
+                    self.max_hold_hours,
+                    avg_entry,
+                    current_rate,
+                    current_profit,
+                )
+                return "timeout_cost_exit"
 
         # 历史最低价相对均价的最大盈利方向跌幅
         drop_from_avg = (avg_entry - low) / avg_entry
@@ -544,14 +573,28 @@ class ShortDeclineStrategy(IStrategy):
         if count >= self.max_entry_position_adjustment:
             return None
         price_rise = (current_rate - first_entry) / first_entry
-        if price_rise >= self._dca_trigger_rise(count + 1):
+        trigger = self._dca_trigger_rise(count + 1)
+        if price_rise >= trigger:
             # 加仓前重置移动止盈最低点：以当前价为新起点重新追踪
             np = self._norm_pair(trade.pair)
             with self._api_lock:
                 self._lowest_price[np] = current_rate
             # 加仓数量与首次相同：保证金 = 数量 × 当前价 / 杠杆
             leverage = float(self.config.get("futures_leverage", 10))
-            return round(first_qty * current_rate / leverage, 2)
+            stake = round(first_qty * current_rate / leverage, 2)
+            logger.info(
+                "[ShortDecline] %s DCA#%d 触发: 首仓价=%.6f 涨幅=%.2f%%(阈值%.0f%%) "
+                "加仓价=%.6f 保证金=%.2f 均价=%.6f",
+                trade.pair,
+                count + 1,
+                first_entry,
+                price_rise * 100,
+                trigger * 100,
+                current_rate,
+                stake,
+                getattr(trade, "open_rate", 0),
+            )
+            return stake
         return None
 
     def custom_stake_amount(

@@ -1,0 +1,107 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+// © CubanEmissary — simplified to BTCUSDT only
+
+//@version=5
+indicator("Strategy Scanner — BTCUSDT", overlay=true)
+
+timeframe = input.timeframe('', 'Timeframe', group="Display Settings")
+myStrategy = input.string("myStrategy", "Strategy", options=["Golden/Death Cross", "+/- 5% in One Candle", "Price Strength Index", "Relative Volume Strength Index", "Stochastic Momentum Index", "myStrategy"], group="Display Settings")
+
+showBuyShapes  = input.bool(true, 'Show Scanner Longs',  group="Display Settings")
+showSellShapes = input.bool(true, 'Show Scanner Shorts', group="Display Settings")
+bColor = input.color(color.new(#00FF00, 0), 'Long Marker Color',  group="Display Settings")
+sColor = input.color(color.new(#FF0000, 0), 'Short Marker Color', group="Display Settings")
+
+sendLong  = input.bool(false, 'Send Individual Long Alerts',  group='Alert Settings')
+sendShort = input.bool(false, 'Send Individual Short Alerts', group='Alert Settings')
+
+longMessage = input.text_area('"side" : "long", "orderType" : "market", "percentStake" : "2", "targetProfit" : "5", "stopLoss" : "1"', "Long Alert", group='Alert Settings')
+shortMessage = input.text_area('"side" : "short", "orderType" : "market", "percentStake" : "2", "targetProfit" : "5", "stopLoss" : "1"', "Short Alert", group='Alert Settings')
+
+// ── Single symbol: BTCUSDT ──
+sym = "BTCUSDT"
+
+// ═══════════════════════════════════════════════
+// Strategy methods
+// ═══════════════════════════════════════════════
+myStrategyFunc(_src, _myStrategy) =>
+
+    if _myStrategy == "Golden/Death Cross"
+        ema50  = ta.ema(_src, 50)
+        ema200 = ta.ema(_src, 200)
+
+        bCondition = ta.crossover(ema50, ema200)  ? 1 : na
+        sCondition = ta.crossunder(ema50, ema200) ? 1 : na
+        [ema50, bCondition, sCondition]
+
+    else if _myStrategy == "+/- 5% in One Candle"
+        bCondition = close <= 0.95 * close[1] ? 1 : na
+        sCondition = close[1] <= 0.95 * close ? 1 : na
+        [_src, bCondition, sCondition]
+
+    else if _myStrategy == "Price Strength Index"
+        u   = math.max(close - close[1], 0)
+        d   = math.max(close[1] - close, 0)
+        rs  = ta.ema(u, 7) / ta.ema(d, 7)
+        res = 100 - 100 / (1 + rs)
+        PSI = ta.hma(res, 56)
+
+        bCondition = ta.crossover(PSI - PSI[1], 0)  ? 1 : na
+        sCondition = ta.crossunder(PSI - PSI[1], 0) ? 1 : na
+        [PSI, bCondition, sCondition]
+
+    else if _myStrategy == "Relative Volume Strength Index"
+        nv   = ta.cum(ta.change(close) * volume)
+        av   = ta.ema(nv, 5)
+        RVSI = ta.rsi(av, 10)
+        x    = ta.ema(RVSI, 10)
+
+        bCondition = (RVSI[1] < x[1]) and (RVSI[2] > RVSI[1]) and (RVSI >= x) and (RVSI[1] < RVSI) ? 1 : na
+        sCondition = (RVSI[1] >= x[1]) and (RVSI[2] < RVSI[1]) and (RVSI >= x) and (RVSI[1] > RVSI) ? 1 : na
+        [RVSI, bCondition, sCondition]
+
+    else if _myStrategy == "Stochastic Momentum Index"
+        ll    = ta.lowest(low, 10)
+        hh    = ta.highest(high, 10)
+        diff  = hh - ll
+        rdiff = close - (hh + ll) / 2
+
+        avgrel  = ta.ema(ta.ema(rdiff, 3), 3)
+        avgdiff = ta.ema(ta.ema(diff, 3), 3)
+        SMI     = avgdiff != 0 ? avgrel / (avgdiff / 2) * 100 : 0
+        SMIsignal = ta.ema(SMI, 3)
+        emasignal = ta.ema(SMI, 10)
+
+        bCondition = SMIsignal < -40 ? 1 : na
+        sCondition = SMIsignal > 40  ? 1 : na
+        [emasignal, bCondition, sCondition]
+
+    else  // "myStrategy" — default RSI
+        ss1 = ta.rsi(close, 7)
+        bCondition = ss1 < 30 ? 1 : na
+        sCondition = ss1 > 70 ? 1 : na
+        [_src, bCondition, sCondition]
+
+// ═══════════════════════════════════════════════
+// Request strategy on BTCUSDT
+// ═══════════════════════════════════════════════
+[ss, bCondition, sCondition] = request.security(sym, timeframe, myStrategyFunc(close, myStrategy), barmerge.gaps_on, barmerge.lookahead_on)
+
+// ═══════════════════════════════════════════════
+// Alerts
+// ═══════════════════════════════════════════════
+buildMessage(symName, val, template) =>
+    result = "{ \"symbol\" : \"" + str.tostring(symName) + "\", \"lastPrice\" : \"" + str.tostring(val) + "\", " + template + " }"
+    result
+
+if sendLong and bCondition == 1
+    alert(buildMessage(sym, ss, longMessage), alert.freq_once_per_bar_close)
+
+if sendShort and sCondition == 1
+    alert(buildMessage(sym, ss, shortMessage), alert.freq_once_per_bar_close)
+
+// ═══════════════════════════════════════════════
+// Plot shapes
+// ═══════════════════════════════════════════════
+plotshape(showBuyShapes  ? bCondition : na, title="Buy BTCUSDT",  style=shape.triangleup,   location=location.belowbar, color=color.new(bColor, 0), size=size.small)
+plotshape(showSellShapes ? sCondition : na, title="Sell BTCUSDT", style=shape.triangledown, location=location.abovebar, color=color.new(sColor, 0), size=size.small)
