@@ -2,7 +2,7 @@
 做空反弹策略（含多头反转）
 
 空头逻辑:
-  入场: 扫描器异动交易对，做空（须满足：24h涨跌幅>-10%，1w/1m/3m趋势≤24h涨幅，当前价/24h最高价≥90%）
+  入场: 扫描器异动交易对 + 24h最高价突破（当前价 > 过去24h最高价），做空
   止损: 200%（保证金亏损比例）
   止盈: 移动止盈（6%激活 / 3%回撤）
   超时: 18小时回到成本价平仓
@@ -90,8 +90,6 @@ class ShortDeclineStrategy(IStrategy):
     _perf_1m_cache: dict[str, float] = {}
     _perf_3m_cache: dict[str, float] = {}
     _price_change_24h_cache: dict[str, float] = {}
-    _high_24h_cache: dict[str, float] = {}
-    _pair_price_cache: dict[str, float] = {}  # 当前价格（用于 24h 最高价比较）
     _eligible_pairs: set[str] = set()
     _first_entry_price: dict[str, float] = {}
     _first_entry_qty: dict[str, float] = {}  # 首次开仓的币数量（用于DCA保持相同数量）
@@ -224,10 +222,6 @@ class ShortDeclineStrategy(IStrategy):
                 self._first_entry_qty[np] = first_qty
         return first_entry, first_qty
 
-    # ── 24h 最高价过滤 ──
-    # 当前价格必须接近 24h 最高价（price/high_24h >= 此值），确认为上涨趋势
-    high_24h_threshold = 0.90
-
     @staticmethod
     def _is_eligible(
         perf_1w: float, perf_1m: float, perf_3m: float, chg_24h: float
@@ -292,37 +286,14 @@ class ShortDeclineStrategy(IStrategy):
                         perf_1m = self._safe_float(r.get("perf_1m"))
                         perf_3m = self._safe_float(r.get("perf_3m"))
                         chg_24h = self._safe_float(r.get("price_change_24h_pct"))
-                        high_24h = self._safe_float(r.get("high_24h"))
-                        price = self._safe_float(r.get("price"))
                         if None in (perf_1w, perf_1m, perf_3m, chg_24h):
                             continue
                         self._perf_1w_cache[pair_key] = perf_1w
                         self._perf_1m_cache[pair_key] = perf_1m
                         self._perf_3m_cache[pair_key] = perf_3m
                         self._price_change_24h_cache[pair_key] = chg_24h
-                        if high_24h is not None and price is not None:
-                            self._high_24h_cache[pair_key] = high_24h
-                            self._pair_price_cache[pair_key] = price
                         if self._is_eligible(perf_1w, perf_1m, perf_3m, chg_24h):
                             self._eligible_pairs.add(pair_key)
-                    # ── 24h 最高价过滤：当前价格必须接近 24h 最高价（上涨趋势）──
-                    _remove_24h: list[str] = []
-                    for pair in list(self._eligible_pairs):
-                        high = self._high_24h_cache.get(pair)
-                        p = self._pair_price_cache.get(pair)
-                        if high is None or high <= 0 or p is None:
-                            continue
-                        ratio = p / high
-                        if ratio < self.high_24h_threshold:
-                            _remove_24h.append(pair)
-                            logger.info(
-                                "[ShortDecline] %s 价格/24h最高价=%.3f < %.2f，从候选移除",
-                                pair,
-                                ratio,
-                                self.high_24h_threshold,
-                            )
-                    for pair in _remove_24h:
-                        self._eligible_pairs.discard(pair)
                     self._last_api_fetch = now
 
             # ── 资金费率过滤（使用可配置阈值） ──
@@ -469,6 +440,14 @@ class ShortDeclineStrategy(IStrategy):
             return dataframe
         if not eligible:
             return dataframe
+
+        # ── 24h 最高价突破：当前价格必须高于过去24h最高价才允许开空 ──
+        lookback = 96  # 24h / 15min = 96 根K线
+        if len(dataframe) >= lookback:
+            high_24h = dataframe["high"].iloc[-lookback:].max()
+            current_close = dataframe["close"].iloc[-1]
+            if current_close <= high_24h:
+                return dataframe
 
         dataframe.loc[dataframe["volume"] > 0, ["enter_short", "enter_tag"]] = (
             1,
