@@ -157,6 +157,7 @@ class ShortDeclineStrategy(IStrategy):
     funding_rate_threshold = (
         -0.0005
     )  # 资金费率阈值 -0.05%，低于此值禁止开空（山寨币急拉时空头付钱）
+    funding_flip_threshold = -0.001  # 资金费率 < -0.1% 时空仓立即平仓转多
 
     _api_lock = threading.Lock()
     _last_api_fetch: float = 0
@@ -585,7 +586,20 @@ class ShortDeclineStrategy(IStrategy):
                 return "long_trailing_take_profit"
             return None
 
-        # ── 空头出场逻辑（原逻辑）──
+        # ── 空头出场逻辑 ──
+
+        # 资金费率过负 → 立即平空转多
+        with self._api_lock:
+            fr = self._funding_rate_cache.get(np)
+        if fr is not None and fr < self.funding_flip_threshold:
+            logger.info(
+                "[ShortDecline] %s 资金费率 %.4f%% < %.2f%%，空仓立即平仓转多",
+                pair,
+                fr * 100,
+                self.funding_flip_threshold * 100,
+            )
+            return "funding_flip_long"
+
         low = current_rate
         tmin = self._safe_float(getattr(trade, "min_rate", None))
         if tmin is not None and tmin > 0:
@@ -756,7 +770,9 @@ class ShortDeclineStrategy(IStrategy):
         np = self._norm_pair(pair)
 
         # ── 空头止损 → 触发多头反转 ──
-        if trade.is_short and "stop_loss" in exit_reason:
+        if trade.is_short and (
+            "stop_loss" in exit_reason or exit_reason == "funding_flip_long"
+        ):
             short_qty = self._safe_float(getattr(trade, "amount", None)) or 0
             entry_count = self._entry_count(trade)
             first_qty = short_qty / entry_count if entry_count > 0 else short_qty
@@ -768,8 +784,9 @@ class ShortDeclineStrategy(IStrategy):
                 }
             self._save_flip_state()
             logger.info(
-                "[ShortDecline] %s 空头止损 @%.6f → 触发多头反转 (数量=%.4f)",
+                "[ShortDecline] %s %s @%.6f → 触发多头反转 (数量=%.4f)",
                 pair,
+                "资金费率翻转" if exit_reason == "funding_flip_long" else "空头止损",
                 rate,
                 first_qty,
             )
