@@ -17,7 +17,6 @@ from datetime import datetime
 from math import isfinite
 from typing import Optional
 
-import pandas as pd
 from freqtrade.strategy import IStrategy
 from pandas import DataFrame
 
@@ -54,9 +53,9 @@ class BollingerStrategy(IStrategy):
     }
 
     # ── 中线参数 ──
-    ma_period = 20      # SMA 周期（布林带中线）
-    slope_period = 5    # 斜率计算周期（N根K线差值）
-    slope_flat = 0.0001 # 斜率绝对值小于此值视为水平（平仓）
+    ma_period = 20  # SMA 周期（布林带中线）
+    slope_period = 5  # 斜率计算周期（N根K线差值）
+    slope_flat = 0.0001  # 斜率绝对值小于此值视为水平（平仓）
 
     @staticmethod
     def _safe_float(value) -> Optional[float]:

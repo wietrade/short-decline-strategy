@@ -212,18 +212,24 @@ class VolumeSurgeHandler(BaseHTTPRequestHandler):
         Binance 合约 (swap) 格式需要 ":USDT" 后缀才能被 expand_pairlist 匹配。
         返回格式: {"pairs": ["SAFE/USDT:USDT", "ME/USDT:USDT", ...], "refresh_period": 60}
         过滤条件: 4h 涨幅 < MIN_CHG4H_PCT 的交易对不进入 pairlist。
+        查询参数: ?no_4h=1 → 跳过 4h 涨幅过滤
         """
+        from urllib.parse import parse_qs
+        params = parse_qs(urlparse(self.path).query)
+        skip_4h = params.get("no_4h", ["0"])[0] == "1"
+
         with G.lock:
             items = []
             for r in G.latest_active_scan:
-                chg4h = r.get("price_change_4h_pct")
-                if chg4h is None or chg4h == "":
-                    continue
-                try:
-                    if float(chg4h) < MIN_CHG4H_PCT:
+                if not skip_4h:
+                    chg4h = r.get("price_change_4h_pct")
+                    if chg4h is None or chg4h == "":
                         continue
-                except (TypeError, ValueError):
-                    continue
+                    try:
+                        if float(chg4h) < MIN_CHG4H_PCT:
+                            continue
+                    except (TypeError, ValueError):
+                        continue
                 pair = self._tv_to_pair(r.get("name", ""))
                 # Binance 合约格式: expand_pairlist 需带 :USDT 后缀才能匹配
                 if pair.endswith("/USDT"):
