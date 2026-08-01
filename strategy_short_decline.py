@@ -89,6 +89,7 @@ class ShortDeclineStrategy(IStrategy):
     _lowest_price: dict[str, float] = {}  # 持仓期间最低价（用于移动止盈）
     _high_24h_cache: dict[str, float] = {}  # 最近24小时最高价（用于入场）
     _low_24h_cache: dict[str, float] = {}  # 最近24小时最低价（用于入场）
+    _range_24h_cache: dict[str, float] = {}  # 24h波幅(高-低)/低（用于调整周月季涨幅）
     _dca_pullback_high: dict[str, float] = {}  # DCA回调模式下的阶段最高价（DCA#3+启用）
     _exited_pairs: set[str] = set()  # 已平仓交易对，永久锁定不再开仓
 
@@ -131,12 +132,16 @@ class ShortDeclineStrategy(IStrategy):
         with self._api_lock:
             self._adx_cache[pair] = float(adx.iloc[-1])
 
-        # 24h 最高点和最低点（15m × 96 = 24h），用于入场条件
+        # 24h 最高点和最低点（15m × 96 = 24h），用于入场条件和涨幅调整
         high_24h = dataframe["high"].rolling(window=96, min_periods=1).max()
         low_24h = dataframe["low"].rolling(window=96, min_periods=1).min()
         with self._api_lock:
             self._high_24h_cache[pair] = float(high_24h.iloc[-1])
             self._low_24h_cache[pair] = float(low_24h.iloc[-1])
+            if low_24h.iloc[-1] > 0:
+                self._range_24h_cache[pair] = float(
+                    (high_24h.iloc[-1] - low_24h.iloc[-1]) / low_24h.iloc[-1] * 100
+                )
 
         self._fetch_perf_data()
         return dataframe
@@ -222,8 +227,8 @@ class ShortDeclineStrategy(IStrategy):
     ) -> bool:
         """判断交易对是否适合做空。
 
-        条件: 4h涨≥8% ∧ 24h涨>0 ∧ 1w/1m/3m(排除4h涨幅) ≤ 0
-        即: 最近4h突然拉盘，但之前一直在跌/横盘
+        条件: 4h涨≥8% ∧ 24h涨>0 ∧ (1w/1m/3m - 24h波幅) ≤ 0
+        即: 最近4h突然拉盘，但减去24h波动后之前一直在跌/横盘
         """
         # 4h 涨幅 ≥ 8%（确认短期拉盘强度）
         if chg_4h < 8:
@@ -231,13 +236,8 @@ class ShortDeclineStrategy(IStrategy):
         # 24h 涨幅 > 0（确认上涨方向）
         if chg_24h <= 0:
             return False
-
-        # 计算排除4h涨幅后的调整值: adj_X = (1+X/100)/(1+chg_4h/100) - 1
-        # 要求调整后均 ≤ 0（说明4h拉盘之前没有上涨）
-        def _excl_4h(perf: float) -> float:
-            return ((1 + perf / 100) / (1 + chg_4h / 100) - 1) * 100
-
-        return all(_excl_4h(v) <= 0 for v in (perf_1w, perf_1m, perf_3m))
+        # 周月季涨幅已在上游减去24h波幅，直接判断 ≤ 0
+        return all(v <= 0 for v in (perf_1w, perf_1m, perf_3m))
 
     def _dca_trigger_rise(self, n: int) -> float:
         """第 n 次加仓需要的累计涨幅（相对首仓价）。
@@ -293,13 +293,18 @@ class ShortDeclineStrategy(IStrategy):
                         chg_4h = self._safe_float(r.get("price_change_4h_pct"))
                         if None in (perf_1w, perf_1m, perf_3m, chg_24h, chg_4h):
                             continue
+                        # 减去24h波幅: 调整后 = 原始 - (24h最高-最低)/最低
+                        range_24h = self._range_24h_cache.get(pair_key, 0)
+                        adj_1w = perf_1w - range_24h
+                        adj_1m = perf_1m - range_24h
+                        adj_3m = perf_3m - range_24h
                         self._perf_1w_cache[pair_key] = perf_1w
                         self._perf_1m_cache[pair_key] = perf_1m
                         self._perf_3m_cache[pair_key] = perf_3m
                         self._price_change_24h_cache[pair_key] = chg_24h
                         self._price_change_4h_cache[pair_key] = chg_4h
                         if self._is_eligible(
-                            perf_1w, perf_1m, perf_3m, chg_4h, chg_24h
+                            adj_1w, adj_1m, adj_3m, chg_4h, chg_24h
                         ):
                             self._eligible_pairs.add(pair_key)
                     self._last_api_fetch = now
@@ -332,13 +337,14 @@ class ShortDeclineStrategy(IStrategy):
                     perf_3m = self._perf_3m_cache.get(pair)
                     chg_24h = self._price_change_24h_cache.get(pair)
                     chg_4h = self._price_change_4h_cache.get(pair)
+                    range_24h = self._range_24h_cache.get(pair, 0)
                     if None not in (
                         perf_1w,
                         perf_1m,
                         perf_3m,
                         chg_24h,
                         chg_4h,
-                    ) and self._is_eligible(perf_1w, perf_1m, perf_3m, chg_4h, chg_24h):
+                    ) and self._is_eligible(perf_1w - range_24h, perf_1m - range_24h, perf_3m - range_24h, chg_4h, chg_24h):
                         self._eligible_pairs.add(pair)
                         logger.info(
                             "[ShortDecline] %s 资金费率已恢复 %.6f，重新加入候选",
@@ -702,6 +708,7 @@ class ShortDeclineStrategy(IStrategy):
             self._lowest_price.pop(np, None)
             self._high_24h_cache.pop(np, None)
             self._low_24h_cache.pop(np, None)
+            self._range_24h_cache.pop(np, None)
             self._dca_pullback_high.pop(np, None)
             self._funding_rate_cache.pop(np, None)
             self._funding_watch_pairs.discard(np)
