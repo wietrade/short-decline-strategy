@@ -1,257 +1,93 @@
-# 成交量异动做空策略 — TradingView Scanner + Freqtrade
+# 做空反弹策略 (Short Decline Strategy)
 
-## 架构总览
-
-```text
-TradingView Scanner API（非官方）
-        │ 每 60 秒轮询
-        ▼
-tv_binance_volume_screener.py  ── 本机 :3001 ──┬── /api/pairlist ──► Freqtrade RemotePairList（选币）
-        │                                       ├── /api/list     ──► ShortDeclineStrategy（数据源：perf/24h）
-        │                                       ├── /api/data     ──► HTML 看板（含已退出历史）
-        │                                       └── /             ──► 监控页面
-        │
-        ▼
-strategy_short_decline.py  ── Freqtrade 纯做空 DCA 策略（ShortDeclineStrategy）
-```
+基于 Freqtrade + 币安合约的纯做空反弹策略。
 
 ---
 
-## 程序说明
+## 快速概览
 
-### 1. 扫描程序 `tv_binance_volume_screener.py`
+| 项目 | 说明 |
+|:---|:---|
+| 策略文件 | `strategy_short_decline.py` |
+| 配置文件 | `config_short_decline.json` |
+| 扫描器 | `tv_binance_volume_screener.py` (TradingView 成交量异动) |
+| 交易所 | Binance Futures (USDT 永续) |
+| 周期 | 15m |
+| 模式 | 模拟盘 (dry_run) |
+| 保证金 | 全仓 (cross) |
+| 杠杆 | 10x |
+| 单笔开仓 | 50 USDT |
+| 最大持仓 | 10 个 |
 
-每 60 秒调用 TradingView Scanner API，筛选 **币安 USDT 永续合约** 中 **24h 成交量变化 > 500%** 的交易对。
+## 策略逻辑（纯空头）
 
-| 特性 | 说明 |
-| :--- | :--- |
-| 活跃窗口 | `ACTIVE_DURATION_MINUTES` = 30，仅用于看板 **NEW 标记**（30分钟内新增显示绿色竖条），不参与 pairlist 过滤 |
-| 重新激活 | 退出后再次满足条件，`entry_time` 重置，重新获得 30 分钟窗口 |
-| 数据清洗 | 数值字段经 `_to_float_or_none()` 处理 → `float \| null` |
-| 历史记录 | SQLite（`data/volume_surge.db`），最多保留 50 条 |
-| HTTP 健壮性 | `ThreadingHTTPServer` + `close_connection=True` + 10s 超时，防 socket 泄漏 |
-| 优雅退出 | 捕获 SIGINT/SIGTERM，`_running=False` 后关闭 HTTP 服务 |
-| 运行方式 | 服务器上用 screen 守护 |
-| 24h 涨幅过滤 | `MIN_CHG24_PCT = 5.0`，`/api/pairlist` 中过滤掉涨幅不足的交易对 |
+| 阶段 | 参数 |
+|:---|:---|
+| 入场 | 扫描器异动交易对（4h涨≥8%, 24h涨>0, 1w/1m/3m涨幅≤24h涨幅） |
+| 入场限制 | 当前价距24h最高点跌幅 > 8% 不开空 |
+| 止损 | **无**（永不爆仓） |
+| 止盈 | 移动止盈：均价偏离 **4%** 激活，从极值回撤 **2%** 平仓 |
+| 超时 | 18 小时后价格回到成本价平仓 |
+| 加仓 | DCA 金字塔：DCA#1 +10% / DCA#2 +20% / DCA#3+ 高点回调3%补仓 |
+| 资金费率 | < **-0.07%** 禁止开空和DCA加仓（仅约束入场，不平仓） |
 
-### 2. 策略 `strategy_short_decline.py`（ShortDeclineStrategy）
-
-**纯做空 + DCA 金字塔加仓策略**，针对长期下跌、短期异动爆拉的山寨币。
-
-| 环节 | 逻辑 |
-| :--- | :--- |
-| 数据源 | 每 60 秒轮询 `http://127.0.0.1:3001/api/list`，缓存 perf 与 24h 涨跌幅 |
-| 入场排除 | ① 24h 跌幅 > 10% 不做空；② `perf_1w/1m/3m − 24h涨幅` 任一 > 0 不做空；③ 资金费率 < -0.05% 暂缓开空 |
-| 数据缺失保护 | 任一字段缺失（perf 或 24h）则该交易对不交易 |
-| 入场方向 | 通过筛选 → 做空（`enter_short`，tag=`short_decline`） |
-| ADX 排序 | 首次开仓按 ADX(14) 从高到低排队，只有候选中最高 ADX 才放行 |
-| 开仓 | 100U 保证金 × 10x 杠杆 = 1000U 名义；记录首仓价与币数量 |
-| DCA 加仓 | 逆势上涨触发，间隔按斐波那契数列递增，币数量与首仓相同，最多 5 次 |
-| 出场 | 基于加权持仓均价 `trade.open_rate` 做移动止盈（激活 **6%**、回撤 **3%**） |
-| 止损 | `custom_stoploss` 返回 -10.0（1000%），等效不止损 |
-
-**出场逻辑关键点**：`use_exit_signal = True` 是 `custom_exit` 被调用的**前提**。Freqtrade 源码中 `custom_exit` 的调用被包在 `if self.use_exit_signal:` 内，若设为 `False` 则出场逻辑完全失效（会导致盈利单永不平仓）。`populate_exit_trend` 不设任何信号，所有出场都在 `custom_exit` 中完成。
-
-**重启健壮性**：首仓价和币数量优先从 `trade.orders` 的真实成交入场订单恢复（`_get_first_entry_state`），内存缓存丢失（重启）也能正确管理已有持仓。
-
-### 资金费率过滤
-
-策略每 60 秒从币安 API（`fapi/v1/premiumIndex`）获取所有永续合约的实时资金费率，作为额外入场过滤：
-
-| 条件 | 行为 |
-| :--- | :--- |
-| 资金费率 < **-0.05%**（如 -0.1%） | 暂缓开空，交易对加入 **监控列表** |
-| 监控中的交易对费率恢复到 **≥ -0.05%** | 还需检查 24h 涨幅 ≥ 5%，**两者都满足**才恢复入场 |
-| 长期停留在监控列表中且已不在扫描结果中 | 自动清理（防内存泄漏） |
-
-阈值在策略代码中通过 `funding_rate_threshold` 定义，默认 `-0.0005`（即 -0.05%）。
-
-**筛选流程：**
-
-```
-扫描器数据 → 原有筛选(perf+ADX) → 资金费率检查 → 最终候选列表
-                                        │
-                                  费率 < -0.05%?
-                                   ├─ 是 → 加入监控列表，暂缓开空
-                                   └─ 否 → 正常加入候选
-                                 每次循环检查监控列表
-                                   └─ 费率已恢复 → 重新进入候选
-```
-
-### DCA 加仓间隔（斐波那契递增）
-
-间隔按斐波那契数列递增，前期密集拉平成本、后期拉宽保留弹药（`_dca_trigger_rise`）：
-
-```text
-gap_i     = short_add_threshold(10%) × fib(i)   # fib = 1,1,2,3,5
-trigger(n) = Σ gap_i (i=1..n)
-```
-
-| 第几次加仓 | fib | 单步间隔 | 累计触发涨幅 |
-| :---: | :---: | :---: | :---: |
-| 1 | 1 | +10% | **+10%** |
-| 2 | 1 | +10% | **+20%** |
-| 3 | 2 | +20% | **+40%** |
-| 4 | 3 | +30% | **+70%** |
-| 5 | 5 | +50% | **+120%** |
-
-### 移动止盈（固定参数）
-
-移动止盈从加权持仓均价 `trade.open_rate` 开始计算。策略记录持仓期间最低价；当价格向盈利方向从均价下跌 **6%** 以上（激活移动止盈），再从最低点反弹 **3%** 以上时平仓。
-
-平仓还有一道硬条件：当前必须仍是盈利状态。也就是空单当前价仍低于加权持仓均价，且 `current_profit > 0`。如果价格已经反弹到均价上方，即使历史最低价曾经触发过激活，也不会按止盈平仓。
-
----
-
-## DCA 如何改善做空均价
-
-做空 DCA 在**更高价位**继续加空，会把加权空单均价抬高。后续移动止盈以 `trade.open_rate` 这个加权持仓均价为盈利起算点，而不是以首仓价为准：
-
-| 仓位 | 开空价 | 平仓价（回首仓） | 盈亏 |
-| :--- | :---: | :---: | :---: |
-| 首仓 | 100 | 100 | 0 |
-| 加仓1 | 110 | 100 | +10 |
-| 加仓2 | 120 | 100 | +20 |
-
-这个例子只说明 DCA 后均价会改善：价格即使只回到首仓附近，加仓部分也已有利润。当前真实出场不再固定等“回到首仓价”，而是等价格先低于加权均价达到动态激活阈值，再从持仓最低点反弹达到动态阈值后平仓。
-
----
-
-## 服务器
+## 远程服务器
 
 | 项目 | 值 |
-| :--- | :--- |
+|:---|:---|
 | IP | `43.165.167.132` |
-| SSH | `ssh -i "43.165.167.132_id_ed25519" root@43.165.167.132` |
-| 公网入口 | [https://bot2.1230sb.com](https://bot2.1230sb.com)（Nginx 反代 `127.0.0.1:3001`） |
-| 策略路径 | `/www/wwwroot/freqtrade/user_data/strategies/strategy_short_decline.py` |
-| 配置路径 | `/www/wwwroot/freqtrade/user_data/config_short_decline.json` |
-| 交易数据库 | `/www/wwwroot/freqtrade/tradesv3_short.sqlite` |
-| 日志 | `/tmp/ft_short.log` |
+| 用户 | `root` |
+| SSH 密钥 | `I:\1H\43.165.167.132_id_ed25519` |
+| SSH 命令 | `ssh -i "I:\1H\43.165.167.132_id_ed25519" -o StrictHostKeyChecking=no root@43.165.167.132` |
 
-### 端口
+### 服务器文件路径
 
-| 服务 | 端口 | 说明 |
-| :--- | :---: | :--- |
-| 扫描程序 API | 3001 | HTTP（仅本机，Nginx 反代到公网） |
-| Freqtrade API | 8001 | REST API + WebSocket |
+| 文件 | 路径 |
+|:---|:---|
+| 策略目录 | `/www/wwwroot/freqtrade/user_data/strategies/` |
+| 配置文件 | `/www/wwwroot/freqtrade/user_data/config_short_decline.json` |
+| 扫描器 | `/www/wwwroot/volume_screener/tv_binance_volume_screener.py` |
+| 扫描器日志 | `/tmp/screener.log` |
+| 策略日志 | `/tmp/ft_short.log` |
 
----
+### 服务端口
 
-## API 接口
+| 端口 | 服务 |
+|:---|:---|
+| 3001 | 扫描器 API |
+| 8001 | Freqtrade (ShortDeclineStrategy) |
 
-### `/api/pairlist` — RemotePairList 数据源
+## 常用命令
 
-供 Freqtrade 配置引用，带 `:USDT` 后缀适配 Binance 合约 `expand_pairlist`。
+### 上传并重启策略
 
-```json
-{"pairs": ["SAFE/USDT:USDT", "ME/USDT:USDT"], "refresh_period": 60}
+```powershell
+scp -i "I:\1H\43.165.167.132_id_ed25519" -o StrictHostKeyChecking=no "I:\1H\short-decline-strategy\strategy_short_decline.py" root@43.165.167.132:/www/wwwroot/freqtrade/user_data/strategies/
+
+ssh -i "I:\1H\43.165.167.132_id_ed25519" -o StrictHostKeyChecking=no root@43.165.167.132 "pkill -9 -f '[f]reqtrade trade' && sleep 1 && cd /www/wwwroot/freqtrade && setsid .venv/bin/freqtrade trade --config user_data/config_short_decline.json --strategy ShortDeclineStrategy > /tmp/ft_short.log 2>&1 &"
 ```
 
-仅含进入时间 ≤ 30 分钟的交易对，按 24h 成交量降序。
+### 查看策略日志
 
-### `/api/list` — 策略数据源
-
-策略实际拉取的接口，返回当前活跃交易对的完整数值字段（含 `price_change_24h_pct`）。
-
-```json
-[{"pair": "SAFE/USDT", "price": 0.1234, "vol_change_24h_pct": 850.5,
-  "price_change_24h_pct": -3.2, "perf_1w": -10.87, "perf_1m": -25.3,
-  "perf_3m": -40.2, "recommend_all": -0.75, "rsi": 42.3}]
+```powershell
+ssh -i "I:\1H\43.165.167.132_id_ed25519" -o StrictHostKeyChecking=no root@43.165.167.132 "tail -50 /tmp/ft_short.log"
 ```
 
-### `/api/data` — 完整数据（含已退出历史）
+### 查看扫描器日志
 
-含 `entry_time`/`exit_time`/`rating_text` 等字段，供浏览器渲染看板。
-
-
-
----
-
-## 部署
-
-### 扫描程序（screen 守护）
-
-```bash
-cd /www/wwwroot/volume_screener
-screen -dmS screener venv/bin/python3 tv_binance_volume_screener.py
-
-# 管理
-screen -r screener            # 附加查看（Ctrl+A D 分离）
-screen -S screener -X quit    # 停止
-ps aux | grep tv_binance | grep -v grep
+```powershell
+ssh -i "I:\1H\43.165.167.132_id_ed25519" -o StrictHostKeyChecking=no root@43.165.167.132 "tail -50 /tmp/screener.log"
 ```
 
-### Freqtrade
+### 检查运行状态
 
-```bash
-cd /www/wwwroot/freqtrade
-
-# 停止旧进程
-pkill -9 -f "[f]reqtrade.*ShortDecline"
-
-# 后台启动
-nohup .venv/bin/freqtrade trade \
-  --strategy ShortDeclineStrategy \
-  --userdir user_data \
-  -c user_data/config_short_decline.json > /tmp/ft_short.log 2>&1 &
-
-# 管理
-pgrep -af "[f]reqtrade.*ShortDecline"  # 查看进程
-tail -f /tmp/ft_short.log              # 查看日志
+```powershell
+ssh -i "I:\1H\43.165.167.132_id_ed25519" -o StrictHostKeyChecking=no root@43.165.167.132 "ps aux | grep freqtrade | grep -v grep; ss -tlnp | grep -E '3001|8001'"
 ```
 
-> ⚠️ 更换策略或清空模拟盘时：`rm -f /www/wwwroot/freqtrade/tradesv3_short.sqlite*`
+### 比对本地与远程策略版本
 
----
-
-## 配置 `config_short_decline.json`
-
-| 参数 | 值 | 说明 |
-| :--- | :---: | :--- |
-| 模式 | dry_run | 模拟盘 |
-| 模拟资金 | 2000 USDT | `dry_run_wallet` |
-| 单笔保证金 | 100 USDT | 由策略 `custom_stake_amount` 控制 |
-| 杠杆 | 10x | `futures_leverage` |
-| 最大持仓 | 10 | `max_open_trades` |
-| 保证金模式 | cross | 全仓 |
-| 入场/退出价侧 | other | 吃对手盘 |
-| 交易对过滤 | 上市 ≥ 90 天 | RemotePairList + AgeFilter |
-
-### 扫描程序常量
-
-| 参数 | 默认值 | 说明 |
-| :--- | :---: | :--- |
-| `MIN_VOL_CHANGE_PCT` | 500 | 24h 成交量变化最小百分比 |
-| `INTERVAL_SECONDS` | 60 | 轮询间隔（秒） |
-| `ACTIVE_DURATION_MINUTES` | 30 | 看板 NEW 标记阈值（非 pairlist 过滤） |
-| `MAX_HISTORY_RECORDS` | 50 | 数据库最多保留记录数 |
-
----
-
-## 文件结构
-
-```text
-i:\1H\
-├── tv_binance_volume_screener.py    # 成交量异动扫描程序
-├── strategy_short_decline.py        # Freqtrade 纯做空 DCA 策略
-├── config_short_decline.json        # Freqtrade 交易配置
-├── 43.165.167.132_id_ed25519        # SSH 密钥
-├── requirements.txt                 # Python 依赖
-├── data/
-│   └── volume_surge.db              # 扫描程序 SQLite 数据库
-└── README.md                        # 本文件
+```powershell
+ssh -i "I:\1H\43.165.167.132_id_ed25519" -o StrictHostKeyChecking=no root@43.165.167.132 "md5sum /www/wwwroot/freqtrade/user_data/strategies/strategy_short_decline.py"
+certutil -hashfile "I:\1H\short-decline-strategy\strategy_short_decline.py" MD5
 ```
-
----
-
-## 常见问题
-
-**Q：盈利很高却不平仓？**
-检查 `use_exit_signal` 是否为 `True`。设为 `False` 会导致 `custom_exit` 从不被调用，出场逻辑失效。
-
-**Q：重启后已有持仓丢失止盈？**
-`_get_first_entry_state` 会从 `trade.orders` 恢复首仓价，无需依赖内存。若订单里读不到，回退用 `trade.open_rate`。
-
-**Q：杠杆变成 1x？**
-dry-run 从 `freqtrade/exchange/binance_leverage_tiers.json` 读杠杆分级，新上线交易对缺失时 `max_leverage` 返回 1.0。手动补该交易对的 tier 后重启。
