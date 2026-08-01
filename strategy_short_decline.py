@@ -3,7 +3,7 @@
 
 空头逻辑:
   入场: 扫描器异动交易对，24h涨幅>4%且从最高点回调>2%时开空
-  入场限制: 24h涨幅 ≤ 4% 或距最高点回调 ≤ 2% 不开空
+  入场限制: 24h涨幅 ≤ 4% 或距最高点回调 ≤ 2% 不开空，平仓后永久锁定
   资金费率: < -0.07% 时禁止开空（DCA加仓不受限制）
   止损: 无（永不爆仓）
   止盈: 移动止盈（4%激活 / 2%回撤）
@@ -90,6 +90,7 @@ class ShortDeclineStrategy(IStrategy):
     _high_24h_cache: dict[str, float] = {}  # 最近24小时最高价（用于入场）
     _low_24h_cache: dict[str, float] = {}  # 最近24小时最低价（用于入场）
     _dca_pullback_high: dict[str, float] = {}  # DCA回调模式下的阶段最高价（DCA#3+启用）
+    _exited_pairs: set[str] = set()  # 已平仓交易对，永久锁定不再开仓
 
     # ── 资金费率 ──
     _funding_rate_cache: dict[
@@ -420,6 +421,11 @@ class ShortDeclineStrategy(IStrategy):
             chg_24h = self._price_change_24h_cache.get(pair)
             eligible = pair in self._eligible_pairs
 
+        # 已平仓过的交易对，不再开仓
+        with self._api_lock:
+            if pair in self._exited_pairs:
+                return dataframe
+
         # 24h涨幅 > 4% 且 从最高点回调 > 2%，才开空
         high_24h = self._high_24h_cache.get(pair)
         low_24h = self._low_24h_cache.get(pair)
@@ -689,7 +695,7 @@ class ShortDeclineStrategy(IStrategy):
     ) -> bool:
         np = self._norm_pair(pair)
 
-        # 清理缓存
+        # 清理缓存，加入锁定名单
         with self._api_lock:
             self._first_entry_price.pop(np, None)
             self._first_entry_qty.pop(np, None)
@@ -699,4 +705,5 @@ class ShortDeclineStrategy(IStrategy):
             self._dca_pullback_high.pop(np, None)
             self._funding_rate_cache.pop(np, None)
             self._funding_watch_pairs.discard(np)
+            self._exited_pairs.add(np)
         return True
