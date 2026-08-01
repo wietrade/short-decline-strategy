@@ -1,21 +1,17 @@
 """
-做空反弹策略（含多头反转）
+做空反弹策略（纯空头，无止损，无翻转）
 
 空头逻辑:
   入场: 扫描器异动交易对，做空
-  止损: 200%（保证金亏损比例）
+  入场限制: 当前价距24h最高点跌幅 > 8% 不开空（反弹已结束）
+  资金费率: < -0.01% 时禁止开空（仅限制入场，不平仓）
+  止损: 无（永不爆仓）
   止盈: 移动止盈（6%激活 / 3%回撤）
   超时: 18小时回到成本价平仓
-  加仓: DCA金字塔（+10%/+20%/+50%/+100%/+200%）
-
-多头逻辑（空头止损后触发）:
-  入场: 空头止损平仓后，按同等数量立即开多
-  止损: 50%
-  止盈: 移动止盈（6%激活 / 3%回撤，与空头相同参数）
-  超时: 18小时回到成本价平仓
-  不加仓
-  多头止损后 → 冷却1小时 → 回到空头模式
-  多头止盈/超时 → 立即回到空头模式
+  加仓: DCA金字塔
+    - DCA #1: 首仓 +10% 涨幅
+    - DCA #2: 首仓 +20% 涨幅
+    - DCA #3+: 追踪阶段最高点回调 3% 补仓（每次补仓后重置峰值）
 """
 
 import logging
@@ -23,7 +19,6 @@ import threading
 import time
 from datetime import datetime
 from math import isfinite
-from typing import Optional
 
 import pandas as pd
 import requests
@@ -48,7 +43,7 @@ class ShortDeclineStrategy(IStrategy):
     margin_mode = "cross"
 
     minimal_roi = {"0": 100}
-    stoploss = -2.0  # 默认空头止损 200%（custom_stoploss 中按方向区分）
+    stoploss = -1.0  # 无止损，永不爆仓
     use_custom_stoploss = True
     trailing_stop = False
 
@@ -70,10 +65,7 @@ class ShortDeclineStrategy(IStrategy):
         "stoploss_on_exchange": False,
     }
 
-    # ── 加仓参数 ──
-    short_add_threshold = 0.10  # 斐波那契基准间隔（相对首仓价）
-
-    # ── 移动止盈参数（相对加权均价，空头/多头共用）──
+    # ── 移动止盈参数（相对加权均价）──
     trail_activate = 0.06  # 盈利方向偏离均价 6% 激活移动止盈
     trail_pullback = 0.03  # 从极值点回撤 3% 平仓
 
@@ -95,59 +87,9 @@ class ShortDeclineStrategy(IStrategy):
     _first_entry_price: dict[str, float] = {}
     _first_entry_qty: dict[str, float] = {}  # 首次开仓的币数量（用于DCA保持相同数量）
     _lowest_price: dict[str, float] = {}  # 持仓期间最低价（用于移动止盈）
-    _highest_price: dict[str, float] = {}  # 多头持仓期间最高价
-
-    # ── 多头反转状态 ──
-    # pair -> {"stop_out_price": float, "stop_out_time": str, "short_qty": float}
-    _flip_to_long: dict[str, dict] = {}
-    # 多头止损冷却期（秒），防止反复翻转
-    _long_cooldown_until: dict[str, float] = {}
-    long_cooldown_seconds = 3600  # 多头止损后 1 小时内不重新开空
-    _flip_state_file = "user_data/flip_state.json"  # 持久化翻转状态（重启不丢失）
-
-    # ── 翻转状态持久化 ──
-
-    def _save_flip_state(self) -> None:
-        import json
-
-        try:
-            with self._api_lock:
-                data = {
-                    "flip_to_long": self._flip_to_long,
-                    "long_cooldown_until": self._long_cooldown_until,
-                }
-            with open(self._flip_state_file, "w") as f:
-                json.dump(data, f, default=str)
-        except Exception as e:
-            logger.warning("[ShortDecline] 保存翻转状态失败: %s", e)
-
-    def _load_flip_state(self) -> None:
-        import json
-        import os
-
-        try:
-            if not os.path.exists(self._flip_state_file):
-                return
-            with open(self._flip_state_file, "r") as f:
-                data = json.load(f)
-            with self._api_lock:
-                self._flip_to_long = data.get("flip_to_long", {})
-                self._long_cooldown_until = data.get("long_cooldown_until", {})
-            # 清理过期的冷却期
-            now = time.time()
-            expired = [p for p, t in self._long_cooldown_until.items() if now >= t]
-            for p in expired:
-                self._long_cooldown_until.pop(p, None)
-                self._flip_to_long.pop(p, None)
-            if expired:
-                self._save_flip_state()
-            logger.info(
-                "[ShortDecline] 已加载翻转状态: flip=%d, cooldown=%d",
-                len(self._flip_to_long),
-                len(self._long_cooldown_until),
-            )
-        except Exception as e:
-            logger.warning("[ShortDecline] 加载翻转状态失败: %s", e)
+    _high_24h_cache: dict[str, float] = {}  # 最近24小时最高价（用于入场跌幅限制）
+    _high_2h_cache: dict[str, float] = {}  # 最近2小时最高价（用于DCA回调加仓）
+    _dca_pullback_high: dict[str, float] = {}  # DCA回调模式下的阶段最高价（DCA#3+启用）
 
     # ── 资金费率 ──
     _funding_rate_cache: dict[
@@ -157,7 +99,6 @@ class ShortDeclineStrategy(IStrategy):
     funding_rate_threshold = (
         -0.0001
     )  # 资金费率阈值 -0.01%，低于此值禁止开空（山寨币急拉时空头付钱）
-    funding_flip_threshold = -0.0001  # 资金费率 < -0.01% 时空仓立即平仓转多
 
     _api_lock = threading.Lock()
     _last_api_fetch: float = 0
@@ -165,10 +106,6 @@ class ShortDeclineStrategy(IStrategy):
     _data_stale_timeout = 300  # 数据过期阈值（秒），超时后暂停开仓
 
     # ── 指标 ──
-
-    def bot_start(self, **kwargs) -> None:
-        """策略启动时从文件恢复翻转状态"""
-        self._load_flip_state()
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         # ADX 仅用于入场优先级排序，不做过滤
@@ -193,13 +130,23 @@ class ShortDeclineStrategy(IStrategy):
         with self._api_lock:
             self._adx_cache[pair] = float(adx.iloc[-1])
 
+        # 24h 最高点（15m × 96 = 24h），用于入场跌幅限制
+        high_24h = dataframe["high"].rolling(window=96, min_periods=1).max()
+        with self._api_lock:
+            self._high_24h_cache[pair] = float(high_24h.iloc[-1])
+
+        # 2h 最高点（15m × 8 = 2h），用于 DCA 回调加仓
+        high_2h = dataframe["high"].rolling(window=8, min_periods=1).max()
+        with self._api_lock:
+            self._high_2h_cache[pair] = float(high_2h.iloc[-1])
+
         self._fetch_perf_data()
         return dataframe
 
     # ── 获取扫描器数据 ──
 
     @staticmethod
-    def _safe_float(value) -> Optional[float]:
+    def _safe_float(value) -> float | None:
         if value is None or value == "":
             return None
         try:
@@ -231,9 +178,7 @@ class ShortDeclineStrategy(IStrategy):
         orders = [o for o in getattr(trade, "orders", []) if self._is_entry_order(o)]
         return max(1, len(orders))
 
-    def _get_first_entry_state(
-        self, trade: Trade
-    ) -> tuple[Optional[float], Optional[float]]:
+    def _get_first_entry_state(self, trade: Trade) -> tuple[float | None, float | None]:
         np = self._norm_pair(trade.pair)
         orders = [o for o in getattr(trade, "orders", []) if self._is_entry_order(o)]
         if orders:
@@ -287,16 +232,14 @@ class ShortDeclineStrategy(IStrategy):
         return all((value - chg_24h) <= 0 for value in (perf_1w, perf_1m, perf_3m))
 
     def _dca_trigger_rise(self, n: int) -> float:
-        """第 n 次加仓（n>=1）需要的累计涨幅（相对首仓价）。
+        """第 n 次加仓需要的累计涨幅（相对首仓价）。
 
-        间隔递增（base=10%）：
-          n=1: 10% / n=2: 20% / n=3: 50% / n=4: 100% / n=5: 200%
+        DCA#1: 10% / DCA#2: 20% / DCA#3+: 回调模式（不再使用此函数）
         """
-        triggers = [0.10, 0.20, 0.50, 1.00, 2.00]
+        triggers = [0.10, 0.20]
         if 1 <= n <= len(triggers):
             return triggers[n - 1]
-        # 超出范围继续按 2× 翻倍
-        return 2.00 * (2 ** (n - 5))
+        return 999.0  # 永不触发（应由回调模式接管）
 
     def _fetch_perf_data(self) -> None:
         now = time.time()
@@ -464,38 +407,27 @@ class ShortDeclineStrategy(IStrategy):
         if self._is_data_stale():
             return dataframe
 
-        # ── 多头反转入口 ──
-        with self._api_lock:
-            flip_info = self._flip_to_long.get(pair)
-
-        if flip_info is not None:
-            # 检查是否已有该交易对的持仓（避免重复开多）
-            open_trades = Trade.get_trades_proxy(is_open=True)
-            already_open = any(self._norm_pair(t.pair) == pair for t in open_trades)
-            if not already_open:
-                dataframe.loc[dataframe["volume"] > 0, ["enter_long", "enter_tag"]] = (
-                    1,
-                    "flip_long",
-                )
-                logger.info(
-                    "[ShortDecline] %s 触发多头反转入口 (空头止损价=%.6f)",
-                    pair,
-                    flip_info.get("stop_out_price", 0),
-                )
-            return dataframe
-
-        # ── 空头入口（原逻辑）──
+        # ── 空头入口 ──
         with self._api_lock:
             perf_1w = self._perf_1w_cache.get(pair)
             perf_1m = self._perf_1m_cache.get(pair)
             perf_3m = self._perf_3m_cache.get(pair)
             chg_24h = self._price_change_24h_cache.get(pair)
             eligible = pair in self._eligible_pairs
-            cooldown_until = self._long_cooldown_until.get(pair, 0)
 
-        # 多头止损冷却期内不开空
-        if cooldown_until > 0 and time.time() < cooldown_until:
-            return dataframe
+        # 当前价距24h最高点跌幅超过8%，不开空（反弹已经走完）
+        high_24h = self._high_24h_cache.get(pair)
+        if high_24h is not None and high_24h > 0:
+            current_close = float(dataframe["close"].iloc[-1])
+            drop_from_24h_high = (high_24h - current_close) / high_24h
+            if drop_from_24h_high > 0.08:
+                logger.info(
+                    "[ShortDecline] %s 距24h高点%.6f跌幅%.2f%% > 8%%，跳过空头入场",
+                    pair,
+                    high_24h,
+                    drop_from_24h_high * 100,
+                )
+                return dataframe
 
         if None in (perf_1w, perf_1m, perf_3m, chg_24h):
             return dataframe
@@ -514,10 +446,7 @@ class ShortDeclineStrategy(IStrategy):
         return dataframe
 
     def custom_stoploss(self, **kwargs) -> float:
-        trade = kwargs.get("trade")
-        if trade is not None and not trade.is_short:
-            return -0.5  # 多头止损 50%
-        return -2.0  # 空头止损 200%
+        return -1.0  # 无止损，永不爆仓
 
     def leverage(
         self,
@@ -542,63 +471,13 @@ class ShortDeclineStrategy(IStrategy):
         current_rate: float,
         current_profit: float,
         **kwargs,
-    ) -> Optional[str]:
+    ) -> str | None:
         np = self._norm_pair(pair)
         avg_entry = self._safe_float(getattr(trade, "open_rate", None))
         if avg_entry is None or avg_entry <= 0:
             return None
 
-        is_long = not trade.is_short
-
-        # ── 多头出场逻辑 ──
-        if is_long:
-            # 跟踪持仓期间最高价
-            high = current_rate
-            tmax = self._safe_float(getattr(trade, "max_rate", None))
-            if tmax is not None and tmax > 0:
-                high = max(high, tmax)
-            with self._api_lock:
-                mem_high = self._highest_price.get(np)
-                if mem_high is not None:
-                    high = max(high, mem_high)
-                self._highest_price[np] = high
-
-            # 超时平仓
-            open_dt = trade.open_date_utc
-            if open_dt is not None:
-                hours = (
-                    current_time.replace(tzinfo=open_dt.tzinfo) - open_dt
-                ).total_seconds() / 3600
-                if hours >= self.max_hold_hours and current_profit >= 0:
-                    return "long_timeout_cost_exit"
-
-            rise_from_avg = (current_rate - avg_entry) / avg_entry
-            highest_rise = (high - avg_entry) / avg_entry
-            pullback = (high - current_rate) / high if high > 0 else 0.0
-
-            # 多头移动止盈：价格高于均价激活阈值，从最高点回落 → 平仓
-            if (
-                rise_from_avg > 0
-                and current_profit > 0
-                and highest_rise >= self.trail_activate
-                and pullback >= self.trail_pullback
-            ):
-                return "long_trailing_take_profit"
-            return None
-
         # ── 空头出场逻辑 ──
-
-        # 资金费率过负 → 立即平空转多
-        with self._api_lock:
-            fr = self._funding_rate_cache.get(np)
-        if fr is not None and fr < self.funding_flip_threshold:
-            logger.info(
-                "[ShortDecline] %s 资金费率 %.4f%% < %.2f%%，空仓立即平仓转多",
-                pair,
-                fr * 100,
-                self.funding_flip_threshold * 100,
-            )
-            return "funding_flip_long"
 
         low = current_rate
         tmin = self._safe_float(getattr(trade, "min_rate", None))
@@ -708,7 +587,7 @@ class ShortDeclineStrategy(IStrategy):
         current_entry_profit: float,
         current_exit_profit: float,
         **kwargs,
-    ) -> Optional[float]:
+    ) -> float | None:
         # 多头不加仓
         if not trade.is_short:
             return None
@@ -718,10 +597,45 @@ class ShortDeclineStrategy(IStrategy):
         count = self._entry_count(trade) - 1
         if count >= self.max_entry_position_adjustment:
             return None
+        np = self._norm_pair(trade.pair)
         price_rise = (current_rate - first_entry) / first_entry
+
+        # ── 价格超过首仓价 20% 后，改用 2h 高点回调 3% 触发加仓 ──
+        if price_rise >= 0.20:
+            with self._api_lock:
+                peak = self._dca_pullback_high.get(np, current_rate)
+                peak = max(peak, current_rate)
+                self._dca_pullback_high[np] = peak
+
+            if peak <= 0:
+                return None
+            pullback = (peak - current_rate) / peak
+            if pullback < 0.03:
+                return None
+
+            # 回调 ≥ 3%，触发加仓
+            with self._api_lock:
+                self._lowest_price[np] = current_rate
+                self._dca_pullback_high[np] = current_rate  # 重置峰值，开始新一轮追踪
+            leverage = float(self.config.get("futures_leverage", 10))
+            stake = round(first_qty * current_rate / leverage, 2)
+            logger.info(
+                "[ShortDecline] %s DCA#%d 回调触发: 首仓价=%.6f 涨幅=%.2f%% "
+                "2h峰值=%.6f 回调=%.2f%% 加仓价=%.6f 保证金=%.2f",
+                trade.pair,
+                count + 1,
+                first_entry,
+                price_rise * 100,
+                peak,
+                pullback * 100,
+                current_rate,
+                stake,
+            )
+            return stake
+
+        # ── 价格未超 20%，按原 DCA 涨幅触发 ──
         trigger = self._dca_trigger_rise(count + 1)
         if price_rise >= trigger:
-            np = self._norm_pair(trade.pair)
             with self._api_lock:
                 self._lowest_price[np] = current_rate
             leverage = float(self.config.get("futures_leverage", 10))
@@ -753,7 +667,7 @@ class ShortDeclineStrategy(IStrategy):
         side: str,
         **kwargs,
     ) -> float:
-        return 100.0
+        return 50.0
 
     def confirm_trade_exit(
         self,
@@ -769,54 +683,14 @@ class ShortDeclineStrategy(IStrategy):
     ) -> bool:
         np = self._norm_pair(pair)
 
-        # ── 空头止损 → 触发多头反转 ──
-        if trade.is_short and (
-            "stop_loss" in exit_reason or exit_reason == "funding_flip_long"
-        ):
-            short_qty = self._safe_float(getattr(trade, "amount", None)) or 0
-            entry_count = self._entry_count(trade)
-            first_qty = short_qty / entry_count if entry_count > 0 else short_qty
-            with self._api_lock:
-                self._flip_to_long[np] = {
-                    "stop_out_price": rate,
-                    "stop_out_time": current_time.isoformat(),
-                    "short_qty": first_qty,
-                }
-            self._save_flip_state()
-            logger.info(
-                "[ShortDecline] %s %s @%.6f → 触发多头反转 (数量=%.4f)",
-                pair,
-                "资金费率翻转" if exit_reason == "funding_flip_long" else "空头止损",
-                rate,
-                first_qty,
-            )
-
-        # ── 多头止损 → 回到空头模式，设冷却期 ──
-        if not trade.is_short and "stop_loss" in exit_reason:
-            with self._api_lock:
-                self._flip_to_long.pop(np, None)
-                self._long_cooldown_until[np] = time.time() + self.long_cooldown_seconds
-            self._save_flip_state()
-            logger.info(
-                "[ShortDecline] %s 多头止损 @%.6f → 回到空头模式 (冷却%ds)",
-                pair,
-                rate,
-                self.long_cooldown_seconds,
-            )
-
-        # ── 多头正常止盈 → 回到空头模式 ──
-        if not trade.is_short and "stop_loss" not in exit_reason:
-            with self._api_lock:
-                self._flip_to_long.pop(np, None)
-            self._save_flip_state()
-            logger.info("[ShortDecline] %s 多头止盈 @%.6f → 回到空头模式", pair, rate)
-
         # 清理缓存
         with self._api_lock:
             self._first_entry_price.pop(np, None)
             self._first_entry_qty.pop(np, None)
             self._lowest_price.pop(np, None)
-            self._highest_price.pop(np, None)
+            self._high_24h_cache.pop(np, None)
+            self._high_2h_cache.pop(np, None)
+            self._dca_pullback_high.pop(np, None)
             self._funding_rate_cache.pop(np, None)
             self._funding_watch_pairs.discard(np)
         return True
