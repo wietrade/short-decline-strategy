@@ -10,7 +10,7 @@
   超时: 18小时回到成本价平仓
   加仓: DCA金字塔
     - DCA #1: 首仓 +10% 涨幅（亏损中加仓）
-    - DCA #2+: 追踪阶段最高点回调 3% 补仓（每次补仓后重置峰值）
+    - DCA #2+: 相对上次加仓价先涨 ≥4%，再回调 ≥3% 补仓（每次补仓后重置峰值和基准价）
 """
 
 import logging
@@ -90,6 +90,9 @@ class ShortDeclineStrategy(IStrategy):
     _low_24h_cache: dict[str, float] = {}  # 最近24小时最低价（用于入场）
     _range_24h_cache: dict[str, float] = {}  # 24h波幅(高-低)/低（用于调整周月季涨幅）
     _dca_pullback_high: dict[str, float] = {}  # DCA回调模式下的阶段最高价（DCA#2+启用）
+    _last_dca_price: dict[
+        str, float
+    ] = {}  # 最近一次加仓的成交价（DCA#2+用于计算4%涨幅基准）
     _exited_pairs: set[str] = set()  # 已平仓交易对，永久锁定不再开仓
 
     # ── 资金费率 ──
@@ -593,6 +596,7 @@ class ShortDeclineStrategy(IStrategy):
             if np not in self._first_entry_price:
                 self._first_entry_price[np] = rate
                 self._first_entry_qty[np] = coin_qty  # 存储首次开仓的币数量
+            self._last_dca_price[np] = rate  # 记录最近一次入场价（DCA#2+回调基准）
         return True
 
     def adjust_trade_position(
@@ -627,6 +631,7 @@ class ShortDeclineStrategy(IStrategy):
             if price_rise >= trigger:
                 with self._api_lock:
                     self._lowest_price[np] = current_rate
+                    self._dca_pullback_high[np] = current_rate  # 为DCA#2回调模式初始化峰值
                 leverage = float(self.config.get("futures_leverage", 10))
                 stake = round(first_qty * current_rate / leverage, 2)
                 logger.info(
@@ -643,16 +648,18 @@ class ShortDeclineStrategy(IStrategy):
                 return stake
             return None
 
-        # ── DCA#2+: 按高点回调 3% 触发 ──
+        # ── DCA#2+: 先涨 ≥4%（相对上次加仓价），再回调 ≥3% 触发 ──
         with self._api_lock:
+            last_price = self._last_dca_price.get(np, first_entry)
             peak = self._dca_pullback_high.get(np, current_rate)
             peak = max(peak, current_rate)
             self._dca_pullback_high[np] = peak
 
-        if peak <= 0:
+        if peak <= 0 or last_price <= 0:
             return None
+        rise_from_last = (peak - last_price) / last_price
         pullback = (peak - current_rate) / peak
-        if pullback < 0.03:
+        if rise_from_last < 0.04 or pullback < 0.03:
             return None
 
         # 回调 ≥ 3%，触发加仓
@@ -662,13 +669,13 @@ class ShortDeclineStrategy(IStrategy):
         leverage = float(self.config.get("futures_leverage", 10))
         stake = round(first_qty * current_rate / leverage, 2)
         logger.info(
-            "[ShortDecline] %s DCA#%d 回调触发: 首仓价=%.6f 涨幅=%.2f%% "
-            "峰值=%.6f 回调=%.2f%% 加仓价=%.6f 保证金=%.2f",
+            "[ShortDecline] %s DCA#%d 回调触发: 上次价=%.6f 峰值=%.6f 先涨=%.2f%% "
+            "回调=%.2f%% 加仓价=%.6f 保证金=%.2f",
             trade.pair,
             count + 1,
-            first_entry,
-            price_rise * 100,
+            last_price,
             peak,
+            rise_from_last * 100,
             pullback * 100,
             current_rate,
             stake,
@@ -713,6 +720,7 @@ class ShortDeclineStrategy(IStrategy):
             self._low_24h_cache.pop(np, None)
             self._range_24h_cache.pop(np, None)
             self._dca_pullback_high.pop(np, None)
+            self._last_dca_price.pop(np, None)
             self._funding_rate_cache.pop(np, None)
             self._funding_watch_pairs.discard(np)
             self._exited_pairs.add(np)
