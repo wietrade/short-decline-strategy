@@ -2,8 +2,8 @@
 做空反弹策略（纯空头，无止损，无翻转）
 
 空头逻辑:
-  入场: 扫描器异动交易对，从24h最高点回调 ≥ 2% 时开空
-  入场限制: 当前价距24h最高点回调 < 2% 不开空（等回调）
+  入场: 扫描器异动交易对，24h涨幅>4%且从最高点回调>2%时开空
+  入场限制: 24h涨幅 ≤ 4% 或距最高点回调 ≤ 2% 不开空
   资金费率: < -0.07% 时禁止开空（DCA加仓不受限制）
   止损: 无（永不爆仓）
   止盈: 移动止盈（4%激活 / 2%回撤）
@@ -87,7 +87,8 @@ class ShortDeclineStrategy(IStrategy):
     _first_entry_price: dict[str, float] = {}
     _first_entry_qty: dict[str, float] = {}  # 首次开仓的币数量（用于DCA保持相同数量）
     _lowest_price: dict[str, float] = {}  # 持仓期间最低价（用于移动止盈）
-    _high_24h_cache: dict[str, float] = {}  # 最近24小时最高价（用于入场跌幅限制）
+    _high_24h_cache: dict[str, float] = {}  # 最近24小时最高价（用于入场）
+    _low_24h_cache: dict[str, float] = {}  # 最近24小时最低价（用于入场）
     _dca_pullback_high: dict[str, float] = {}  # DCA回调模式下的阶段最高价（DCA#3+启用）
 
     # ── 资金费率 ──
@@ -129,10 +130,12 @@ class ShortDeclineStrategy(IStrategy):
         with self._api_lock:
             self._adx_cache[pair] = float(adx.iloc[-1])
 
-        # 24h 最高点（15m × 96 = 24h），用于入场跌幅限制
+        # 24h 最高点和最低点（15m × 96 = 24h），用于入场条件
         high_24h = dataframe["high"].rolling(window=96, min_periods=1).max()
+        low_24h = dataframe["low"].rolling(window=96, min_periods=1).min()
         with self._api_lock:
             self._high_24h_cache[pair] = float(high_24h.iloc[-1])
+            self._low_24h_cache[pair] = float(low_24h.iloc[-1])
 
         self._fetch_perf_data()
         return dataframe
@@ -417,16 +420,18 @@ class ShortDeclineStrategy(IStrategy):
             chg_24h = self._price_change_24h_cache.get(pair)
             eligible = pair in self._eligible_pairs
 
-        # 距24h最高点回调不足2%，不开空（等回调到位）
+        # 24h涨幅 > 4% 且 从最高点回调 > 2%，才开空
         high_24h = self._high_24h_cache.get(pair)
-        if high_24h is not None and high_24h > 0:
+        low_24h = self._low_24h_cache.get(pair)
+        if high_24h and low_24h and high_24h > 0 and low_24h > 0:
             current_close = float(dataframe["close"].iloc[-1])
+            range_pct = (high_24h - low_24h) / low_24h
             pullback = (high_24h - current_close) / high_24h
-            if pullback < 0.02:
+            if range_pct <= 0.04 or pullback <= 0.02:
                 logger.info(
-                    "[ShortDecline] %s 距24h高点%.6f回调%.2f%% < 2%%，等待回调",
+                    "[ShortDecline] %s 24h波幅%.1f%% 回调%.1f%% 不满足(需>4%%且>2%%)",
                     pair,
-                    high_24h,
+                    range_pct * 100,
                     pullback * 100,
                 )
                 return dataframe
@@ -690,6 +695,7 @@ class ShortDeclineStrategy(IStrategy):
             self._first_entry_qty.pop(np, None)
             self._lowest_price.pop(np, None)
             self._high_24h_cache.pop(np, None)
+            self._low_24h_cache.pop(np, None)
             self._dca_pullback_high.pop(np, None)
             self._funding_rate_cache.pop(np, None)
             self._funding_watch_pairs.discard(np)
