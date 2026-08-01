@@ -4,9 +4,9 @@
 空头逻辑:
   入场: 扫描器异动交易对，做空
   入场限制: 当前价距24h最高点跌幅 > 8% 不开空（反弹已结束）
-  资金费率: < -0.01% 时禁止开空（仅限制入场，不平仓）
+  资金费率: < -0.07% 时禁止开空和DCA加仓
   止损: 无（永不爆仓）
-  止盈: 移动止盈（6%激活 / 3%回撤）
+  止盈: 移动止盈（4%激活 / 2%回撤）
   超时: 18小时回到成本价平仓
   加仓: DCA金字塔
     - DCA #1: 首仓 +10% 涨幅
@@ -66,8 +66,8 @@ class ShortDeclineStrategy(IStrategy):
     }
 
     # ── 移动止盈参数（相对加权均价）──
-    trail_activate = 0.06  # 盈利方向偏离均价 6% 激活移动止盈
-    trail_pullback = 0.03  # 从极值点回撤 3% 平仓
+    trail_activate = 0.04  # 盈利方向偏离均价 4% 激活移动止盈
+    trail_pullback = 0.02  # 从极值点回撤 2% 平仓
 
     # ── 持仓超时平仓 ──
     max_hold_hours = 18  # 持仓超过此时间后，价格回到成本价即平仓
@@ -97,8 +97,8 @@ class ShortDeclineStrategy(IStrategy):
     ] = {}  # pair -> 当前资金费率（如 -0.005 = -0.5%）
     _funding_watch_pairs: set[str] = set()  # 因资金费率过负被暂缓的交易对
     funding_rate_threshold = (
-        -0.0001
-    )  # 资金费率阈值 -0.01%，低于此值禁止开空（山寨币急拉时空头付钱）
+        -0.0007
+    )  # 资金费率阈值 -0.07%，低于此值禁止开空和DCA加仓（山寨币急拉时空头付钱）
 
     _api_lock = threading.Lock()
     _last_api_fetch: float = 0
@@ -588,9 +588,22 @@ class ShortDeclineStrategy(IStrategy):
         current_exit_profit: float,
         **kwargs,
     ) -> float | None:
-        # 多头不加仓
         if not trade.is_short:
             return None
+
+        np = self._norm_pair(trade.pair)
+        # 资金费率约束：DCA加仓也受资金费率限制
+        with self._api_lock:
+            fr = self._funding_rate_cache.get(np)
+        if fr is not None and fr < self.funding_rate_threshold:
+            logger.info(
+                "[ShortDecline] %s 资金费率 %.6f < %.4f，跳过DCA加仓",
+                trade.pair,
+                fr,
+                self.funding_rate_threshold,
+            )
+            return None
+
         first_entry, first_qty = self._get_first_entry_state(trade)
         if first_entry is None or first_qty is None:
             return None
