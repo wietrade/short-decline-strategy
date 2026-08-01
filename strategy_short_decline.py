@@ -61,7 +61,7 @@ class ShortDeclineStrategy(IStrategy):
     # 第 N 次回调加仓 = 上次加仓价先涨 dca_callback_rise[N] 再回调 dca_callback_pullback[N]
     # 列表用完后沿用最后一个值
     dca_callback_rise = [0.50, 0.40]  # DCA#2 涨50%, DCA#3+ 涨40%
-    dca_callback_pullback = [0.30]  # 统一回调30%
+    dca_callback_pullback = [0.20]  # 统一回调20%
 
     # ── 订单类型 ──
     order_types = {
