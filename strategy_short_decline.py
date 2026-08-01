@@ -4,7 +4,7 @@
 空头逻辑:
   入场: 扫描器异动交易对，做空
   入场限制: 当前价距24h最高点跌幅 > 8% 不开空（反弹已结束）
-  资金费率: < -0.07% 时禁止开空和DCA加仓
+  资金费率: < -0.07% 时禁止开空（DCA加仓不受限制）
   止损: 无（永不爆仓）
   止盈: 移动止盈（4%激活 / 2%回撤）
   超时: 18小时回到成本价平仓
@@ -88,7 +88,6 @@ class ShortDeclineStrategy(IStrategy):
     _first_entry_qty: dict[str, float] = {}  # 首次开仓的币数量（用于DCA保持相同数量）
     _lowest_price: dict[str, float] = {}  # 持仓期间最低价（用于移动止盈）
     _high_24h_cache: dict[str, float] = {}  # 最近24小时最高价（用于入场跌幅限制）
-    _high_2h_cache: dict[str, float] = {}  # 最近2小时最高价（用于DCA回调加仓）
     _dca_pullback_high: dict[str, float] = {}  # DCA回调模式下的阶段最高价（DCA#3+启用）
 
     # ── 资金费率 ──
@@ -98,7 +97,7 @@ class ShortDeclineStrategy(IStrategy):
     _funding_watch_pairs: set[str] = set()  # 因资金费率过负被暂缓的交易对
     funding_rate_threshold = (
         -0.0007
-    )  # 资金费率阈值 -0.07%，低于此值禁止开空和DCA加仓（山寨币急拉时空头付钱）
+    )  # 资金费率阈值 -0.07%，低于此值禁止开空（DCA加仓不受限制）
 
     _api_lock = threading.Lock()
     _last_api_fetch: float = 0
@@ -134,11 +133,6 @@ class ShortDeclineStrategy(IStrategy):
         high_24h = dataframe["high"].rolling(window=96, min_periods=1).max()
         with self._api_lock:
             self._high_24h_cache[pair] = float(high_24h.iloc[-1])
-
-        # 2h 最高点（15m × 8 = 2h），用于 DCA 回调加仓
-        high_2h = dataframe["high"].rolling(window=8, min_periods=1).max()
-        with self._api_lock:
-            self._high_2h_cache[pair] = float(high_2h.iloc[-1])
 
         self._fetch_perf_data()
         return dataframe
@@ -275,10 +269,8 @@ class ShortDeclineStrategy(IStrategy):
                         pair_key = (
                             name.split(":")[0]
                             if "/" in name
-                            else name.replace(".P", "").split(":")[0]
+                            else name.replace(".P", "")
                         )
-                        # 标准化：去掉后缀如 :USDT
-                        pair_key = pair_key.split(":")[0]
                         # 确保是 xxx/USDT 格式
                         if "/" not in pair_key:
                             for quote in ("USDT", "USDC", "BUSD"):
@@ -368,7 +360,7 @@ class ShortDeclineStrategy(IStrategy):
                 self._funding_watch_pairs -= stale_watch
 
         except Exception as e:
-            print(f"[ShortDecline] 获取扫描器数据失败: {e}")
+            logger.error("[ShortDecline] 获取扫描器数据失败: %s", e)
 
     def _is_data_stale(self) -> bool:
         """扫描器数据是否过期（超过 _data_stale_timeout 秒未成功更新）。"""
@@ -388,7 +380,7 @@ class ShortDeclineStrategy(IStrategy):
 
         接口: GET /fapi/v1/premiumIndex
         返回示例: {"symbol":"BTCUSDT","lastFundingRate":"0.0001",...}
-        阈值 funding_rate_threshold = -0.0005 即 -0.05%，策略代码中定义
+        阈值 funding_rate_threshold = -0.0007 即 -0.07%，策略代码中定义
         """
         try:
             resp = requests.get(
@@ -408,7 +400,7 @@ class ShortDeclineStrategy(IStrategy):
                                     self._funding_rate_cache[pair] = rate
                                     break
         except Exception as e:
-            print(f"[ShortDecline] 获取资金费率失败: {e}")
+            logger.error("[ShortDecline] 获取资金费率失败: %s", e)
 
     # ── 入场 ──
 
@@ -602,80 +594,66 @@ class ShortDeclineStrategy(IStrategy):
             return None
 
         np = self._norm_pair(trade.pair)
-        # 资金费率约束：DCA加仓也受资金费率限制
-        with self._api_lock:
-            fr = self._funding_rate_cache.get(np)
-        if fr is not None and fr < self.funding_rate_threshold:
-            logger.info(
-                "[ShortDecline] %s 资金费率 %.6f < %.4f，跳过DCA加仓",
-                trade.pair,
-                fr,
-                self.funding_rate_threshold,
-            )
-            return None
-
         first_entry, first_qty = self._get_first_entry_state(trade)
         if first_entry is None or first_qty is None:
             return None
         count = self._entry_count(trade) - 1
         if count >= self.max_entry_position_adjustment:
             return None
-        np = self._norm_pair(trade.pair)
         price_rise = (current_rate - first_entry) / first_entry
 
-        # ── 价格超过首仓价 20% 后，改用 2h 高点回调 3% 触发加仓 ──
-        if price_rise >= 0.20:
-            with self._api_lock:
-                peak = self._dca_pullback_high.get(np, current_rate)
-                peak = max(peak, current_rate)
-                self._dca_pullback_high[np] = peak
+        # ── 先检查 DCA 涨幅触发（DCA#1: +10%, DCA#2: +20%）──
+        if price_rise < 0.20:
+            trigger = self._dca_trigger_rise(count + 1)
+            if price_rise >= trigger:
+                with self._api_lock:
+                    self._lowest_price[np] = current_rate
+                leverage = float(self.config.get("futures_leverage", 10))
+                stake = round(first_qty * current_rate / leverage, 2)
+                logger.info(
+                    "[ShortDecline] %s DCA#%d 触发: 首仓价=%.6f 涨幅=%.2f%%(阈值%.0f%%) "
+                    "加仓价=%.6f 保证金=%.2f",
+                    trade.pair,
+                    count + 1,
+                    first_entry,
+                    price_rise * 100,
+                    trigger * 100,
+                    current_rate,
+                    stake,
+                )
+                return stake
 
-            if peak <= 0:
-                return None
-            pullback = (peak - current_rate) / peak
-            if pullback < 0.03:
-                return None
+        # ── 价格 ≥ 首仓价+20%: DCA#3+ 按高点回调 3% 触发 ──
+        with self._api_lock:
+            peak = self._dca_pullback_high.get(np, current_rate)
+            peak = max(peak, current_rate)
+            self._dca_pullback_high[np] = peak
 
-            # 回调 ≥ 3%，触发加仓
-            with self._api_lock:
-                self._lowest_price[np] = current_rate
-                self._dca_pullback_high[np] = current_rate  # 重置峰值，开始新一轮追踪
-            leverage = float(self.config.get("futures_leverage", 10))
-            stake = round(first_qty * current_rate / leverage, 2)
-            logger.info(
-                "[ShortDecline] %s DCA#%d 回调触发: 首仓价=%.6f 涨幅=%.2f%% "
-                "2h峰值=%.6f 回调=%.2f%% 加仓价=%.6f 保证金=%.2f",
-                trade.pair,
-                count + 1,
-                first_entry,
-                price_rise * 100,
-                peak,
-                pullback * 100,
-                current_rate,
-                stake,
-            )
-            return stake
+        if peak <= 0:
+            return None
+        pullback = (peak - current_rate) / peak
+        if pullback < 0.03:
+            return None
 
-        # ── 价格未超 20%，按原 DCA 涨幅触发 ──
-        trigger = self._dca_trigger_rise(count + 1)
-        if price_rise >= trigger:
-            with self._api_lock:
-                self._lowest_price[np] = current_rate
-            leverage = float(self.config.get("futures_leverage", 10))
-            stake = round(first_qty * current_rate / leverage, 2)
-            logger.info(
-                "[ShortDecline] %s DCA#%d 触发: 首仓价=%.6f 涨幅=%.2f%%(阈值%.0f%%) "
-                "加仓价=%.6f 保证金=%.2f",
-                trade.pair,
-                count + 1,
-                first_entry,
-                price_rise * 100,
-                trigger * 100,
-                current_rate,
-                stake,
-            )
-            return stake
-        return None
+        # 回调 ≥ 3%，触发加仓
+        with self._api_lock:
+            self._lowest_price[np] = current_rate
+            self._dca_pullback_high[np] = current_rate  # 重置峰值，开始新一轮追踪
+        leverage = float(self.config.get("futures_leverage", 10))
+        stake = round(first_qty * current_rate / leverage, 2)
+        logger.info(
+            "[ShortDecline] %s DCA#%d 回调触发: 首仓价=%.6f 涨幅=%.2f%% "
+            "峰值=%.6f 回调=%.2f%% 加仓价=%.6f 保证金=%.2f",
+            trade.pair,
+            count + 1,
+            first_entry,
+            price_rise * 100,
+            peak,
+            pullback * 100,
+            current_rate,
+            stake,
+        )
+        return stake
 
     def custom_stake_amount(
         self,
@@ -712,7 +690,6 @@ class ShortDeclineStrategy(IStrategy):
             self._first_entry_qty.pop(np, None)
             self._lowest_price.pop(np, None)
             self._high_24h_cache.pop(np, None)
-            self._high_2h_cache.pop(np, None)
             self._dca_pullback_high.pop(np, None)
             self._funding_rate_cache.pop(np, None)
             self._funding_watch_pairs.discard(np)
