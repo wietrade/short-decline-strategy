@@ -303,9 +303,7 @@ class ShortDeclineStrategy(IStrategy):
                         self._perf_3m_cache[pair_key] = perf_3m
                         self._price_change_24h_cache[pair_key] = chg_24h
                         self._price_change_4h_cache[pair_key] = chg_4h
-                        if self._is_eligible(
-                            adj_1w, adj_1m, adj_3m, chg_4h, chg_24h
-                        ):
+                        if self._is_eligible(adj_1w, adj_1m, adj_3m, chg_4h, chg_24h):
                             self._eligible_pairs.add(pair_key)
                     self._last_api_fetch = now
 
@@ -344,7 +342,13 @@ class ShortDeclineStrategy(IStrategy):
                         perf_3m,
                         chg_24h,
                         chg_4h,
-                    ) and self._is_eligible(perf_1w - range_24h, perf_1m - range_24h, perf_3m - range_24h, chg_4h, chg_24h):
+                    ) and self._is_eligible(
+                        perf_1w - range_24h,
+                        perf_1m - range_24h,
+                        perf_3m - range_24h,
+                        chg_4h,
+                        chg_24h,
+                    ):
                         self._eligible_pairs.add(pair)
                         logger.info(
                             "[ShortDecline] %s 资金费率已恢复 %.6f，重新加入候选",
@@ -639,8 +643,9 @@ class ShortDeclineStrategy(IStrategy):
                     stake,
                 )
                 return stake
+            return None
 
-        # ── 价格 ≥ 首仓价+20%: DCA#3+ 按高点回调 3% 触发 ──
+        # ── DCA#3+: 按高点回调 3% 触发 ──
         with self._api_lock:
             peak = self._dca_pullback_high.get(np, current_rate)
             peak = max(peak, current_rate)
