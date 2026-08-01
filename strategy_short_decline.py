@@ -218,8 +218,8 @@ class ShortDeclineStrategy(IStrategy):
     ) -> bool:
         """判断交易对是否适合做空。
 
-        条件: 4h涨≥8% ∧ 24h涨>0 ∧ 1w/1m/3m(排除24h涨幅) ≤ 0
-        即: 最近24h突然拉盘，但之前一直在跌/横盘
+        条件: 4h涨≥8% ∧ 24h涨>0 ∧ 1w/1m/3m(排除4h涨幅) ≤ 0
+        即: 最近4h突然拉盘，但之前一直在跌/横盘
         """
         # 4h 涨幅 ≥ 8%（确认短期拉盘强度）
         if chg_4h < 8:
@@ -228,12 +228,12 @@ class ShortDeclineStrategy(IStrategy):
         if chg_24h <= 0:
             return False
 
-        # 计算排除24h涨幅后的调整值: adj_X = (1+X/100)/(1+C/100) - 1
-        # 要求调整后均 ≤ 0（说明24h之前的周期没有上涨）
-        def _excl_24h(perf: float) -> float:
-            return ((1 + perf / 100) / (1 + chg_24h / 100) - 1) * 100
+        # 计算排除4h涨幅后的调整值: adj_X = (1+X/100)/(1+chg_4h/100) - 1
+        # 要求调整后均 ≤ 0（说明4h拉盘之前没有上涨）
+        def _excl_4h(perf: float) -> float:
+            return ((1 + perf / 100) / (1 + chg_4h / 100) - 1) * 100
 
-        return all(_excl_24h(v) <= 0 for v in (perf_1w, perf_1m, perf_3m))
+        return all(_excl_4h(v) <= 0 for v in (perf_1w, perf_1m, perf_3m))
 
     def _dca_trigger_rise(self, n: int) -> float:
         """第 n 次加仓需要的累计涨幅（相对首仓价）。
@@ -602,8 +602,8 @@ class ShortDeclineStrategy(IStrategy):
             return None
         price_rise = (current_rate - first_entry) / first_entry
 
-        # ── 先检查 DCA 涨幅触发（DCA#1: +10%, DCA#2: +20%）──
-        if price_rise < 0.20:
+        # ── DCA#1 (+10%) 和 DCA#2 (+20%) 按涨幅触发 ──
+        if count < 2:
             trigger = self._dca_trigger_rise(count + 1)
             if price_rise >= trigger:
                 with self._api_lock:
@@ -638,7 +638,7 @@ class ShortDeclineStrategy(IStrategy):
         # 回调 ≥ 3%，触发加仓
         with self._api_lock:
             self._lowest_price[np] = current_rate
-            self._dca_pullback_high[np] = current_rate  # 重置峰值，开始新一轮追踪
+            self._dca_pullback_high[np] = current_rate
         leverage = float(self.config.get("futures_leverage", 10))
         stake = round(first_qty * current_rate / leverage, 2)
         logger.info(
