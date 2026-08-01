@@ -9,9 +9,8 @@
   止盈: 移动止盈（4%激活 / 2%回撤）
   超时: 18小时回到成本价平仓
   加仓: DCA金字塔
-    - DCA #1: 首仓 +10% 涨幅
-    - DCA #2: 首仓 +20% 涨幅
-    - DCA #3+: 追踪阶段最高点回调 3% 补仓（每次补仓后重置峰值）
+    - DCA #1: 首仓 +10% 涨幅（亏损中加仓）
+    - DCA #2+: 追踪阶段最高点回调 3% 补仓（每次补仓后重置峰值）
 """
 
 import logging
@@ -90,7 +89,7 @@ class ShortDeclineStrategy(IStrategy):
     _high_24h_cache: dict[str, float] = {}  # 最近24小时最高价（用于入场）
     _low_24h_cache: dict[str, float] = {}  # 最近24小时最低价（用于入场）
     _range_24h_cache: dict[str, float] = {}  # 24h波幅(高-低)/低（用于调整周月季涨幅）
-    _dca_pullback_high: dict[str, float] = {}  # DCA回调模式下的阶段最高价（DCA#3+启用）
+    _dca_pullback_high: dict[str, float] = {}  # DCA回调模式下的阶段最高价（DCA#2+启用）
     _exited_pairs: set[str] = set()  # 已平仓交易对，永久锁定不再开仓
 
     # ── 资金费率 ──
@@ -242,12 +241,11 @@ class ShortDeclineStrategy(IStrategy):
     def _dca_trigger_rise(self, n: int) -> float:
         """第 n 次加仓需要的累计涨幅（相对首仓价）。
 
-        DCA#1: 10% / DCA#2: 20% / DCA#3+: 回调模式（不再使用此函数）
+        仅 DCA#1 使用涨幅触发（10%），DCA#2+ 全部走回调模式。
         """
-        triggers = [0.10, 0.20]
-        if 1 <= n <= len(triggers):
-            return triggers[n - 1]
-        return 999.0  # 永不触发（应由回调模式接管）
+        if n == 1:
+            return 0.10
+        return 999.0  # DCA#2+ 走回调模式
 
     def _fetch_perf_data(self) -> None:
         now = time.time()
@@ -623,8 +621,8 @@ class ShortDeclineStrategy(IStrategy):
             return None
         price_rise = (current_rate - first_entry) / first_entry
 
-        # ── DCA#1 (+10%) 和 DCA#2 (+20%) 按涨幅触发 ──
-        if count < 2:
+        # ── DCA#1 (+10% 涨幅触发) ──
+        if count < 1:
             trigger = self._dca_trigger_rise(count + 1)
             if price_rise >= trigger:
                 with self._api_lock:
@@ -645,7 +643,7 @@ class ShortDeclineStrategy(IStrategy):
                 return stake
             return None
 
-        # ── DCA#3+: 按高点回调 3% 触发 ──
+        # ── DCA#2+: 按高点回调 3% 触发 ──
         with self._api_lock:
             peak = self._dca_pullback_high.get(np, current_rate)
             peak = max(peak, current_rate)
