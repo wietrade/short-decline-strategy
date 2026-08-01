@@ -222,14 +222,24 @@ class ShortDeclineStrategy(IStrategy):
     def _is_eligible(
         perf_1w: float, perf_1m: float, perf_3m: float, chg_4h: float, chg_24h: float
     ) -> bool:
+        """判断交易对是否适合做空。
+
+        条件: 4h涨≥8% ∧ 24h涨>0 ∧ 1w/1m/3m(排除24h涨幅) ≤ 0
+        即: 最近24h突然拉盘，但之前一直在跌/横盘
+        """
         # 4h 涨幅 ≥ 8%（确认短期拉盘强度）
         if chg_4h < 8:
             return False
         # 24h 涨幅 > 0（确认上涨方向）
         if chg_24h <= 0:
             return False
-        # 1w/1m/3m 涨幅 ≤ 24h 涨幅（说明近期才开始涨）
-        return all((value - chg_24h) <= 0 for value in (perf_1w, perf_1m, perf_3m))
+
+        # 计算排除24h涨幅后的调整值: adj_X = (1+X/100)/(1+C/100) - 1
+        # 要求调整后均 ≤ 0（说明24h之前的周期没有上涨）
+        def _excl_24h(perf: float) -> float:
+            return ((1 + perf / 100) / (1 + chg_24h / 100) - 1) * 100
+
+        return all(_excl_24h(v) <= 0 for v in (perf_1w, perf_1m, perf_3m))
 
     def _dca_trigger_rise(self, n: int) -> float:
         """第 n 次加仓需要的累计涨幅（相对首仓价）。
