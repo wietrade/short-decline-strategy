@@ -2,8 +2,8 @@
 做空反弹策略（纯空头，无止损，无翻转）
 
 空头逻辑:
-  入场: 扫描器异动交易对，做空
-  入场限制: 当前价距24h最高点跌幅 > 8% 不开空（反弹已结束）
+  入场: 扫描器异动交易对，从24h最高点回调 ≥ 2% 时开空
+  入场限制: 当前价距24h最高点回调 < 2% 不开空（等回调）
   资金费率: < -0.07% 时禁止开空（DCA加仓不受限制）
   止损: 无（永不爆仓）
   止盈: 移动止盈（4%激活 / 2%回撤）
@@ -417,17 +417,17 @@ class ShortDeclineStrategy(IStrategy):
             chg_24h = self._price_change_24h_cache.get(pair)
             eligible = pair in self._eligible_pairs
 
-        # 当前价距24h最高点跌幅超过8%，不开空（反弹已经走完）
+        # 距24h最高点回调不足2%，不开空（等回调到位）
         high_24h = self._high_24h_cache.get(pair)
         if high_24h is not None and high_24h > 0:
             current_close = float(dataframe["close"].iloc[-1])
-            drop_from_24h_high = (high_24h - current_close) / high_24h
-            if drop_from_24h_high > 0.08:
+            pullback = (high_24h - current_close) / high_24h
+            if pullback < 0.02:
                 logger.info(
-                    "[ShortDecline] %s 距24h高点%.6f跌幅%.2f%% > 8%%，跳过空头入场",
+                    "[ShortDecline] %s 距24h高点%.6f回调%.2f%% < 2%%，等待回调",
                     pair,
                     high_24h,
-                    drop_from_24h_high * 100,
+                    pullback * 100,
                 )
                 return dataframe
 
