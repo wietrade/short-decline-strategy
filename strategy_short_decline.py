@@ -43,7 +43,7 @@ class ShortDeclineStrategy(IStrategy):
     margin_mode = "cross"
 
     minimal_roi = {"0": 100}
-    stoploss = -1.0  # 无止损，永不爆仓
+    stoploss = -99.0  # 无止损（-9900% / 10x杠杆 = 价格需反向990%才触发，永不触发）
     use_custom_stoploss = True
     trailing_stop = False
 
@@ -484,7 +484,7 @@ class ShortDeclineStrategy(IStrategy):
         return dataframe
 
     def custom_stoploss(self, **kwargs) -> float:
-        return -1.0  # 无止损，永不爆仓
+        return -99.0  # 无止损，永不触发
 
     def leverage(
         self,
