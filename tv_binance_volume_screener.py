@@ -33,7 +33,7 @@ import requests
 # ═══════════════════════════════════════════════
 # 配置
 # ═══════════════════════════════════════════════
-MIN_VOL_CHANGE_PCT = 500  # 24h 成交量变化最小百分比
+MIN_VOL_CHANGE_PCT = 200  # 24h 成交量变化最小百分比
 MIN_CHG4H_PCT = 8.0  # 4h 涨幅最小百分比（低于此值不出现在 pairlist 中）
 MAX_RESULTS = 200  # 最大结果数
 INTERVAL_SECONDS = 60  # 更新间隔（秒），60 = 1分钟
@@ -215,6 +215,7 @@ class VolumeSurgeHandler(BaseHTTPRequestHandler):
         查询参数: ?no_4h=1 → 跳过 4h 涨幅过滤
         """
         from urllib.parse import parse_qs
+
         params = parse_qs(urlparse(self.path).query)
         skip_4h = params.get("no_4h", ["0"])[0] == "1"
 
