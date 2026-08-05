@@ -5,7 +5,7 @@
   入场: 扫描器异动交易对，24h涨幅>4%且从最高点回调在(2%,5%]时开空
   入场限制: 24h涨幅 ≤ 4% 或回调 ≤ 2% 或回调 > 5% 不开空，平仓后永久锁定
   资金费率: < -0.07% 时禁止开空
-  止损: -25%
+  止损: -80%（触发翻转做多）
   止盈: 移动止盈（4%激活 / 2%回撤）
   超时: 18小时回到成本价平仓
 
@@ -46,7 +46,7 @@ class ShortDeclineFlipStrategy(IStrategy):
     margin_mode = "cross"
 
     minimal_roi = {"0": 100}
-    stoploss = -25.0  # 止损 -25%
+    stoploss = -0.80  # 止损 -80%（custom_stoploss 覆盖）
     use_custom_stoploss = True
     trailing_stop = False
 
@@ -421,9 +421,9 @@ class ShortDeclineFlipStrategy(IStrategy):
         current_profit: float,
         **kwargs,
     ) -> float:
-        # 空头止损 -25%，多头（翻转）止损 -80%
-        if trade.is_short:
-            return -0.25
+        # 多空统一 -80% 止损
+        # 空头：custom_exit 优先在 -80% 翻转，stoploss 作为兜底
+        # 多头：-80% 止损平仓
         return -0.80
 
     def leverage(
@@ -613,6 +613,14 @@ class ShortDeclineFlipStrategy(IStrategy):
             with self._api_lock:
                 my_adx = self._adx_cache.get(np, 0)
                 eligible_pairs = set(self._eligible_pairs)
+                logger.info(
+                    "[ShortDeclineFlip] ADX check: pair=%s my_adx=%.1f eligible=%s open=%s cache_size=%d",
+                    np,
+                    my_adx,
+                    eligible_pairs,
+                    open_pairs,
+                    len(self._adx_cache),
+                )
                 for p, adx in sorted(self._adx_cache.items(), key=lambda x: -x[1]):
                     if (
                         p in eligible_pairs
@@ -620,9 +628,17 @@ class ShortDeclineFlipStrategy(IStrategy):
                         and p != np
                         and adx > my_adx
                     ):
+                        logger.info(
+                            "[ShortDeclineFlip] %s denied: %s has higher ADX (%.1f > %.1f)",
+                            np,
+                            p,
+                            adx,
+                            my_adx,
+                        )
                         return False
                     if adx <= my_adx:
                         break
+                logger.info("[ShortDeclineFlip] %s ADX check PASSED", np)
 
         return True
 
