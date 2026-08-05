@@ -5,7 +5,7 @@
   入场: 扫描器异动交易对，24h涨幅>4%且从最高点回调在(2%,5%]时开空
   入场限制: 24h涨幅 ≤ 4% 或回调 ≤ 2% 或回调 > 5% 不开空，平仓后永久锁定
   资金费率: < -0.07% 时禁止开空
-  止损: -80%（触发翻转做多）
+  止损: -80%（空头止损自动翻转做多，多头直接平仓）
   止盈: 移动止盈（4%激活 / 2%回撤）
   超时: 18小时回到成本价平仓
 
@@ -422,8 +422,8 @@ class ShortDeclineFlipStrategy(IStrategy):
         **kwargs,
     ) -> float:
         # 多空统一 -80% 止损
-        # 空头：custom_exit 优先在 -80% 翻转，stoploss 作为兜底
-        # 多头：-80% 止损平仓
+        # 空头止损 → confirm_trade_exit 中触发翻转做多
+        # 多头止损 → 直接平仓
         return -0.80
 
     def leverage(
@@ -492,16 +492,7 @@ class ShortDeclineFlipStrategy(IStrategy):
     ) -> str | None:
         """空头出场：80%亏损翻转 / 移动止盈"""
 
-        # ── 80%亏损 → 翻转做多 ──
-        if current_profit <= -0.80:
-            logger.info(
-                "[ShortDeclineFlip] %s 空头亏损%.1f%% ≥80%%，翻转做多",
-                trade.pair,
-                abs(current_profit) * 100,
-            )
-            return "flip_to_long"
-
-        # ── 移动止盈 ──
+        # ── 移动止盈（空头止损翻转由 stoploss 接管）──
         low = current_rate
         tmin = self._safe_float(getattr(trade, "min_rate", None))
         if tmin is not None and tmin > 0:
@@ -671,11 +662,13 @@ class ShortDeclineFlipStrategy(IStrategy):
     ) -> bool:
         np = self._norm_pair(pair)
 
-        if exit_reason == "flip_to_long":
-            # 翻转做多：记录翻转价，不加入锁定名单
+        # 空头止损出场 → 翻转做多
+        if trade.is_short and exit_reason == "stop_loss":
             with self._api_lock:
                 self._flip_long_pairs[np] = rate
-            logger.info("[ShortDeclineFlip] %s 空头平仓价=%.6f，准备开多", pair, rate)
+            logger.info(
+                "[ShortDeclineFlip] %s 空头止损平仓价=%.6f，翻转做多", pair, rate
+            )
         else:
             # 正常平仓：加入永久锁定名单
             with self._api_lock:
