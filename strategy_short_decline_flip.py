@@ -1,17 +1,16 @@
 """
-做空反弹策略（80%亏损翻转做多，无加仓）
+做空反弹策略（50%亏损翻转做多，无加仓）
 
 空头逻辑:
-  入场: 扫描器异动交易对，24h涨幅>4%且从最高点回调在(2%,5%]时开空
-  入场限制: 24h涨幅 ≤ 4% 或回调 ≤ 2% 或回调 > 5% 不开空，平仓后永久锁定
+  入场: 扫描器异动交易对，24h涨幅>5%且<20% 且 4h涨幅>3% 且 从最高点回调>1% 时开空
   资金费率: < -0.07% 时禁止开空
-  止损: -80%（空头止损自动翻转做多，多头直接平仓）
+  止损: -50%（空头止损自动翻转做多，多头直接平仓）
   止盈: 移动止盈（4%激活 / 2%回撤）
   超时: 18小时回到成本价平仓
 
 多头翻转逻辑:
-  触发: 空头亏损达80%时立即平空开多
-  止损: -80%
+  触发: 空头亏损达50%时立即平空开多
+  止损: -50%
   止盈: 移动止盈（4%激活 / 2%回撤）同空头
   超时: 18小时回到成本价平仓
   ADX排序: 同空头
@@ -33,7 +32,7 @@ logger = logging.getLogger(__name__)
 
 
 class ShortDeclineFlipStrategy(IStrategy):
-    """做空反弹策略 - 80%亏损翻转做多，无加仓"""
+    """做空反弹策略 - 50%亏损翻转做多，无加仓"""
 
     INTERFACE_VERSION = 3
 
@@ -46,7 +45,7 @@ class ShortDeclineFlipStrategy(IStrategy):
     margin_mode = "cross"
 
     minimal_roi = {"0": 100}
-    stoploss = -0.80  # 止损 -80%（custom_stoploss 覆盖）
+    stoploss = -0.50  # 止损 -50%（custom_stoploss 覆盖）
     use_custom_stoploss = True
     trailing_stop = False
 
@@ -357,6 +356,7 @@ class ShortDeclineFlipStrategy(IStrategy):
             perf_1m = self._perf_1m_cache.get(pair)
             perf_3m = self._perf_3m_cache.get(pair)
             chg_24h = self._price_change_24h_cache.get(pair)
+            chg_4h = self._price_change_4h_cache.get(pair)
             eligible = pair in self._eligible_pairs
 
         # 已平仓过的交易对（非翻转），不再开仓
@@ -373,32 +373,42 @@ class ShortDeclineFlipStrategy(IStrategy):
                 )
                 return dataframe
 
-        # ── 空头入口条件检查 ──
-        high_24h = self._high_24h_cache.get(pair)
-        low_24h = self._low_24h_cache.get(pair)
-        if high_24h and low_24h and high_24h > 0 and low_24h > 0:
-            current_close = float(dataframe["close"].iloc[-1])
-            range_pct = (high_24h - low_24h) / low_24h
-            pullback = (high_24h - current_close) / high_24h
-            if range_pct <= 0.04 or pullback <= 0.02:
-                logger.info(
-                    "[ShortDecline] %s 24h波幅%.1f%% 回调%.1f%% 不满足(需>4%%且>2%%)",
-                    pair,
-                    range_pct * 100,
-                    pullback * 100,
-                )
-                return dataframe
-            if pullback > 0.05:
-                logger.info(
-                    "[ShortDecline] %s 回调%.1f%% >5%% 跌幅过大，禁止开空",
-                    pair,
-                    pullback * 100,
-                )
-                return dataframe
-
-        if None in (perf_1w, perf_1m, perf_3m, chg_24h):
+        # ── 空头入场条件检查 ──
+        # 条件1: 扫描器数据完整性
+        if None in (perf_1w, perf_1m, perf_3m, chg_24h, chg_4h):
             return dataframe
         if not eligible:
+            return dataframe
+
+        # 条件2: 24h K线数据
+        high_24h = self._high_24h_cache.get(pair)
+        low_24h = self._low_24h_cache.get(pair)
+        if not (high_24h and low_24h and high_24h > 0 and low_24h > 0):
+            return dataframe
+
+        current_close = float(dataframe["close"].iloc[-1])
+        pullback = (high_24h - current_close) / high_24h  # 从24h最高点回调幅度
+
+        # 条件3: 24h涨幅 5% < chg_24h < 20%
+        if chg_24h <= 5:
+            logger.info("[ShortDecline] %s 24h涨幅%.1f%% ≤5%%，不开空", pair, chg_24h)
+            return dataframe
+        if chg_24h >= 20:
+            logger.info(
+                "[ShortDecline] %s 24h涨幅%.1f%% ≥20%%，涨幅过大不开空", pair, chg_24h
+            )
+            return dataframe
+
+        # 条件4: 4h涨幅 > 3%
+        if chg_4h <= 3:
+            logger.info("[ShortDecline] %s 4h涨幅%.1f%% ≤3%%，不开空", pair, chg_4h)
+            return dataframe
+
+        # 条件5: 从24h最高点回调 > 1%
+        if pullback <= 0.01:
+            logger.info(
+                "[ShortDecline] %s 回调%.1f%% ≤1%%，不开空", pair, pullback * 100
+            )
             return dataframe
 
         dataframe.loc[dataframe["volume"] > 0, ["enter_short", "enter_tag"]] = (
@@ -421,10 +431,10 @@ class ShortDeclineFlipStrategy(IStrategy):
         current_profit: float,
         **kwargs,
     ) -> float:
-        # 多空统一 -80% 止损
+        # 多空统一 -50% 止损
         # 空头止损 → confirm_trade_exit 中触发翻转做多
         # 多头止损 → 直接平仓
-        return -0.80
+        return -0.50
 
     def leverage(
         self,
@@ -646,7 +656,7 @@ class ShortDeclineFlipStrategy(IStrategy):
         side: str,
         **kwargs,
     ) -> float:
-        return 50.0
+        return 100.0
 
     def confirm_trade_exit(
         self,
