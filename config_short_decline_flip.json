@@ -10,10 +10,10 @@
   "futures_leverage": 10,
   "dataformat_ohlcv": "feather",
   "initial_state": "running",
-  "pair_whitelist": ["BTC/USDT:USDT"],
   "pairlists": [
     {
-      "method": "StaticPairList"
+      "method": "StaticPairList",
+      "pair_whitelist": ["BTC/USDT:USDT"]
     },
     {
       "method": "RemotePairList",
@@ -58,7 +58,6 @@
       }
     }
   },
-  "pairlist_method": ["StaticPairList"],
   "telegram": {
     "enabled": false,
     "token": "",
