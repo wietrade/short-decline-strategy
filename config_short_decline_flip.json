@@ -12,6 +12,10 @@
   "initial_state": "running",
   "pairlists": [
     {
+      "method": "StaticPairList",
+      "pairs": ["BTC/USDT:USDT"]
+    },
+    {
       "method": "RemotePairList",
       "pairlist_url": "http://localhost:3001/api/pairlist",
       "number_assets": null,
