@@ -43,8 +43,8 @@ class ShortDeclineStrategy(IStrategy):
     margin_mode = "cross"
 
     minimal_roi = {"0": 100}
-    stoploss = -25.0  # 止损 -25%
-    use_custom_stoploss = True
+    stoploss = -0.50  # 固定止损 -50%保证金（10x杠杆下 = 价格反向5%触发）
+    use_custom_stoploss = False
     trailing_stop = False
 
     # custom_exit 只在 use_exit_signal=True 时才会被调用；
@@ -482,9 +482,6 @@ class ShortDeclineStrategy(IStrategy):
 
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         return dataframe
-
-    def custom_stoploss(self, **kwargs) -> float:
-        return -99.0  # 无止损，永不触发
 
     def leverage(
         self,
