@@ -248,6 +248,8 @@ class VolumeSurgeHandler(BaseHTTPRequestHandler):
             # 按成交量降序排序
             items.sort(key=lambda x: x[1], reverse=True)
             pairlist = [p[0] for p in items]
+        # BTC 始终在列表首位（供策略判断市场方向，不参与交易）
+        pairlist.insert(0, "BTC/USDT:USDT")
         result = {"pairs": pairlist, "refresh_period": INTERVAL_SECONDS}
         body = json.dumps(result, ensure_ascii=False, default=str).encode("utf-8")
         self.send_response(200)
@@ -902,7 +904,6 @@ setInterval(fetchData, 10000);
 
     def log_message(self, format, *args):
         """抑制 HTTP 日志输出，保持终端干净。"""
-        pass
 
 
 # ═══════════════════════════════════════════════

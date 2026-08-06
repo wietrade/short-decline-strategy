@@ -133,7 +133,7 @@ class ShortDeclineFlipStrategy(IStrategy):
         with self._api_lock:
             self._adx_cache[pair] = float(adx.iloc[-1])
 
-        # BTC 8h涨跌幅（全局市场方向）
+        # BTC 8h涨跌幅（全局市场方向，从 K 线直接计算）
         if pair == "BTC/USDT":
             btc_8h = (
                 (close.iloc[-1] - close.shift(32).iloc[-1])
@@ -359,6 +359,10 @@ class ShortDeclineFlipStrategy(IStrategy):
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         pair = self._norm_pair(metadata.get("pair", ""))
         if self._is_data_stale():
+            return dataframe
+
+        # BTC 不参与交易，仅用于全局方向判断
+        if pair == "BTC/USDT":
             return dataframe
 
         # ── 空头入口 ──
