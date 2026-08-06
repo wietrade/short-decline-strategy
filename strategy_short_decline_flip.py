@@ -84,6 +84,8 @@ class ShortDeclineFlipStrategy(IStrategy):
     _perf_3m_cache: dict[str, float] = {}
     _price_change_24h_cache: dict[str, float] = {}
     _price_change_4h_cache: dict[str, float] = {}
+    _price_change_8h_cache: dict[str, float] = {}  # K线计算，非扫描器
+    _price_change_2h_cache: dict[str, float] = {}  # K线计算，非扫描器
     _eligible_pairs: set[str] = set()
     _lowest_price: dict[str, float] = {}  # 持仓期间最低价（空头移动止盈用）
     _highest_price: dict[str, float] = {}  # 持仓期间最高价（多头移动止盈用）
@@ -152,6 +154,24 @@ class ShortDeclineFlipStrategy(IStrategy):
             if low_24h.iloc[-1] > 0:
                 self._range_24h_cache[pair] = float(
                     (high_24h.iloc[-1] - low_24h.iloc[-1]) / low_24h.iloc[-1] * 100
+                )
+
+        # 8h 涨跌幅（15m × 32 = 8h），用于做多入场限制
+        close_8h_ago = close.shift(32).iloc[-1]
+        if close_8h_ago > 0:
+            chg_8h = (close.iloc[-1] - close_8h_ago) / close_8h_ago * 100
+            with self._api_lock:
+                self._price_change_8h_cache[pair] = (
+                    float(chg_8h) if isfinite(chg_8h) else 0
+                )
+
+        # 2h 涨跌幅（15m × 8 = 2h），用于做多入场限制
+        close_2h_ago = close.shift(8).iloc[-1]
+        if close_2h_ago > 0:
+            chg_2h = (close.iloc[-1] - close_2h_ago) / close_2h_ago * 100
+            with self._api_lock:
+                self._price_change_2h_cache[pair] = (
+                    float(chg_2h) if isfinite(chg_2h) else 0
                 )
 
         self._fetch_perf_data()
@@ -379,7 +399,7 @@ class ShortDeclineFlipStrategy(IStrategy):
             if pair in self._exited_pairs:
                 return dataframe
 
-        # ── 翻转做多入口（优先检查）──
+        # ── 翻转做多入口（优先检查，无额外限制）──
         with self._api_lock:
             if pair in self._flip_long_pairs:
                 dataframe.loc[dataframe["volume"] > 0, ["enter_long", "enter_tag"]] = (
@@ -388,15 +408,33 @@ class ShortDeclineFlipStrategy(IStrategy):
                 )
                 return dataframe
 
-        # ── 全局方向：BTC 8h涨>0 → 做多 ──
+        # ── 全局方向：BTC 8h涨>0 → 做多（需满足 24h>10%, 8h>5%, 4h>2%, 2h>0%）──
         with self._api_lock:
             btc_up = self._btc_8h_pct > 0
         if btc_up and eligible:
-            dataframe.loc[dataframe["volume"] > 0, ["enter_long", "enter_tag"]] = (
-                1,
-                "btc_long",
-            )
-            return dataframe
+            with self._api_lock:
+                c24 = self._price_change_24h_cache.get(pair)
+                c8 = self._price_change_8h_cache.get(pair)
+                c4 = self._price_change_4h_cache.get(pair)
+                c2 = self._price_change_2h_cache.get(pair)
+            if c24 is not None and c8 is not None and c4 is not None and c2 is not None:
+                if c24 > 10 and c8 > 5 and c4 > 2 and c2 > 0:
+                    dataframe.loc[
+                        dataframe["volume"] > 0, ["enter_long", "enter_tag"]
+                    ] = (
+                        1,
+                        "btc_long",
+                    )
+                    return dataframe
+                else:
+                    logger.info(
+                        "[ShortDeclineFlip] %s btc_long blocked: 24h=%.1f 8h=%.1f 4h=%.1f 2h=%.1f",
+                        pair,
+                        c24,
+                        c8,
+                        c4,
+                        c2,
+                    )
 
         # ── 空头入场条件检查 ──
         # 条件1: 扫描器数据完整性
