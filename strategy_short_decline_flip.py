@@ -45,8 +45,8 @@ class ShortDeclineFlipStrategy(IStrategy):
     margin_mode = "cross"
 
     minimal_roi = {"0": 100}
-    stoploss = -0.50  # 止损 -50%（custom_stoploss 覆盖）
-    use_custom_stoploss = True
+    stoploss = -0.50  # 固定止损 -50%（10x杠杆下 = 价格跌5%触发）
+    use_custom_stoploss = False
     trailing_stop = False
 
     # custom_exit 只在 use_exit_signal=True 时才会被调用；
@@ -446,20 +446,6 @@ class ShortDeclineFlipStrategy(IStrategy):
 
     def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         return dataframe
-
-    def custom_stoploss(
-        self,
-        pair: str,
-        trade: Trade,
-        current_time: datetime,
-        current_rate: float,
-        current_profit: float,
-        **kwargs,
-    ) -> float:
-        # 多空统一 -50% 止损
-        # 空头止损 → confirm_trade_exit 中触发翻转做多
-        # 多头止损 → 直接平仓
-        return -0.50
 
     def leverage(
         self,
