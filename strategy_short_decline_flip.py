@@ -2,7 +2,7 @@
 做空反弹策略（50%亏损翻转做多，无加仓）
 
 空头逻辑:
-  入场: 扫描器异动交易对，24h涨幅>5%且<20% 且 4h涨幅>3% 且 从最高点回调>1% 时开空
+  入场: BTC 8h涨>0 → 做多; BTC 8h涨≤0 → 扫描器异动交易对，24h涨幅>5%且<20% 且 4h涨幅>3% 且 从最高点回调>1% 时开空
   资金费率: < -0.07% 时禁止开空
   止损: -50%（空头止损自动翻转做多，多头直接平仓）
   止盈: 移动止盈（4%激活 / 2%回撤）
@@ -92,6 +92,7 @@ class ShortDeclineFlipStrategy(IStrategy):
     _range_24h_cache: dict[str, float] = {}  # 24h波幅(高-低)/低（用于调整周月季涨幅）
     _exited_pairs: set[str] = set()  # 已平仓交易对，永久锁定不再开仓
     _flip_long_pairs: dict[str, float] = {}  # 翻转做多的交易对 -> 空头平仓价
+    _btc_8h_pct: float = 0  # BTC 8小时涨跌幅%，>0则全局做多
 
     # ── 资金费率 ──
     _funding_rate_cache: dict[
@@ -131,6 +132,16 @@ class ShortDeclineFlipStrategy(IStrategy):
         pair = self._norm_pair(metadata.get("pair", ""))
         with self._api_lock:
             self._adx_cache[pair] = float(adx.iloc[-1])
+
+        # BTC 8h涨跌幅（全局市场方向）
+        if pair == "BTC/USDT":
+            btc_8h = (
+                (close.iloc[-1] - close.shift(32).iloc[-1])
+                / close.shift(32).iloc[-1]
+                * 100
+            )
+            with self._api_lock:
+                self._btc_8h_pct = float(btc_8h) if isfinite(btc_8h) else 0
 
         # 24h 最高点和最低点（15m × 96 = 24h），用于入场条件和涨幅调整
         high_24h = dataframe["high"].rolling(window=96, min_periods=1).max()
@@ -373,6 +384,16 @@ class ShortDeclineFlipStrategy(IStrategy):
                 )
                 return dataframe
 
+        # ── 全局方向：BTC 8h涨>0 → 做多 ──
+        with self._api_lock:
+            btc_up = self._btc_8h_pct > 0
+        if btc_up and eligible:
+            dataframe.loc[dataframe["volume"] > 0, ["enter_long", "enter_tag"]] = (
+                1,
+                "btc_long",
+            )
+            return dataframe
+
         # ── 空头入场条件检查 ──
         # 条件1: 扫描器数据完整性
         if None in (perf_1w, perf_1m, perf_3m, chg_24h, chg_4h):
@@ -603,6 +624,11 @@ class ShortDeclineFlipStrategy(IStrategy):
             with self._api_lock:
                 self._flip_long_pairs.pop(np, None)
             logger.info("[ShortDeclineFlip] %s 翻转做多入场 @ %.6f", pair, rate)
+            return True
+
+        # ── 全局方向做多：直接允许入场 ──
+        if entry_tag == "btc_long":
+            logger.info("[ShortDeclineFlip] %s BTC 8h涨>0 做多入场 @ %.6f", pair, rate)
             return True
 
         # ── 空头入场 ADX 优先级排序 ──
