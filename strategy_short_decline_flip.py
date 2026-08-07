@@ -5,13 +5,13 @@
   入场: BTC 8h涨>0 → 做多; BTC 8h涨≤0 → 扫描器异动交易对，24h涨幅>5%且<20% 且 4h涨幅>3% 且 从最高点回调>1% 时开空
   资金费率: < -0.07% 时禁止开空
   止损: -50%（空头止损自动翻转做多，多头直接平仓）
-  止盈: 移动止盈（4%激活 / 2%回撤）
+  止盈: 移动止盈（杠杆后利润40%激活 / 从峰值回撤20个百分点平仓）
   超时: 18小时回到成本价平仓
 
 多头翻转逻辑:
   触发: 空头亏损达50%时立即平空开多
   止损: -50%
-  止盈: 移动止盈（4%激活 / 2%回撤）同空头
+  止盈: 移动止盈（杠杆后利润40%激活 / 从峰值回撤20个百分点平仓）同空头
   超时: 18小时回到成本价平仓
   ADX排序: 同空头
 """
@@ -66,9 +66,9 @@ class ShortDeclineFlipStrategy(IStrategy):
         "stoploss_on_exchange": False,
     }
 
-    # ── 移动止盈参数（相对加权均价）──
-    trail_activate = 0.04  # 盈利方向偏离均价 4% 激活移动止盈
-    trail_pullback = 0.02  # 从极值点回撤 2% 平仓
+    # ── 移动止盈参数（基于杠杆后利润）──
+    trail_activate = 0.40  # 杠杆后利润达到 40% 激活移动止盈
+    trail_pullback = 0.20  # 从利润峰值回撤 20 个百分点平仓（如峰值 45% → 现 25% 平仓）
 
     # ── 持仓超时平仓 ──
     max_hold_hours = 18  # 持仓超过此时间后，价格回到成本价即平仓
@@ -87,8 +87,7 @@ class ShortDeclineFlipStrategy(IStrategy):
     _price_change_8h_cache: dict[str, float] = {}  # K线计算，非扫描器
     _price_change_2h_cache: dict[str, float] = {}  # K线计算，非扫描器
     _eligible_pairs: set[str] = set()
-    _lowest_price: dict[str, float] = {}  # 持仓期间最低价（空头移动止盈用）
-    _highest_price: dict[str, float] = {}  # 持仓期间最高价（多头移动止盈用）
+    _max_profit: dict[str, float] = {}  # 持仓期间最大利润（杠杆后），移动止盈用
     _high_24h_cache: dict[str, float] = {}  # 最近24小时最高价（用于入场）
     _low_24h_cache: dict[str, float] = {}  # 最近24小时最低价（用于入场）
     _range_24h_cache: dict[str, float] = {}  # 24h波幅(高-低)/低（用于调整周月季涨幅）
@@ -549,40 +548,32 @@ class ShortDeclineFlipStrategy(IStrategy):
         current_profit: float,
         avg_entry: float,
     ) -> str | None:
-        """空头出场：80%亏损翻转 / 移动止盈"""
+        """空头出场：移动止盈（基于杠杆后利润）"""
 
-        # ── 移动止盈（空头止损翻转由 stoploss 接管）──
-        low = current_rate
-        tmin = self._safe_float(getattr(trade, "min_rate", None))
-        if tmin is not None and tmin > 0:
-            low = min(low, tmin)
+        # ── 移动止盈：追踪利润峰值 ──
+        max_profit = current_profit
         with self._api_lock:
-            mem_low = self._lowest_price.get(np)
-            if mem_low is not None:
-                low = min(low, mem_low)
-            self._lowest_price[np] = low
+            mem_profit = self._max_profit.get(np)
+            if mem_profit is not None:
+                max_profit = max(max_profit, mem_profit)
+            self._max_profit[np] = max_profit
 
-        drop_from_avg = (avg_entry - low) / avg_entry
-        current_drop_from_avg = (avg_entry - current_rate) / avg_entry
-        rebound = (current_rate - low) / low if low > 0 else 0.0
+        profit_drawdown = max_profit - current_profit  # 从峰值回撤了多少
 
         logger.info(
-            "custom_exit %s SHORT avg=%s low=%s cur=%s drop=%.3f cur_drop=%.3f profit=%.3f rebound=%.3f",
+            "custom_exit %s SHORT avg=%s cur=%s profit=%.3f max_profit=%.3f drawdown=%.3f",
             trade.pair,
             avg_entry,
-            low,
             current_rate,
-            drop_from_avg,
-            current_drop_from_avg,
             current_profit,
-            rebound,
+            max_profit,
+            profit_drawdown,
         )
 
         if (
-            current_drop_from_avg > 0
-            and current_profit > 0
-            and drop_from_avg >= self.trail_activate
-            and rebound >= self.trail_pullback
+            current_profit > 0
+            and max_profit >= self.trail_activate
+            and profit_drawdown >= self.trail_pullback
         ):
             return "trailing_take_profit"
         return None
@@ -595,40 +586,32 @@ class ShortDeclineFlipStrategy(IStrategy):
         current_profit: float,
         avg_entry: float,
     ) -> str | None:
-        """多头出场：移动止盈（同空头参数）"""
+        """多头出场：移动止盈（基于杠杆后利润，同空头参数）"""
 
-        # ── 移动止盈（追踪最高价）──
-        high = current_rate
-        tmax = self._safe_float(getattr(trade, "max_rate", None))
-        if tmax is not None and tmax > 0:
-            high = max(high, tmax)
+        # ── 移动止盈：追踪利润峰值 ──
+        max_profit = current_profit
         with self._api_lock:
-            mem_high = self._highest_price.get(np)
-            if mem_high is not None:
-                high = max(high, mem_high)
-            self._highest_price[np] = high
+            mem_profit = self._max_profit.get(np)
+            if mem_profit is not None:
+                max_profit = max(max_profit, mem_profit)
+            self._max_profit[np] = max_profit
 
-        rise_from_avg = (high - avg_entry) / avg_entry
-        current_rise_from_avg = (current_rate - avg_entry) / avg_entry
-        pullback = (high - current_rate) / high if high > 0 else 0.0
+        profit_drawdown = max_profit - current_profit  # 从峰值回撤了多少
 
         logger.info(
-            "custom_exit %s LONG avg=%s high=%s cur=%s rise=%.3f cur_rise=%.3f profit=%.3f pullback=%.3f",
+            "custom_exit %s LONG avg=%s cur=%s profit=%.3f max_profit=%.3f drawdown=%.3f",
             trade.pair,
             avg_entry,
-            high,
             current_rate,
-            rise_from_avg,
-            current_rise_from_avg,
             current_profit,
-            pullback,
+            max_profit,
+            profit_drawdown,
         )
 
         if (
-            current_rise_from_avg > 0
-            and current_profit > 0
-            and rise_from_avg >= self.trail_activate
-            and pullback >= self.trail_pullback
+            current_profit > 0
+            and max_profit >= self.trail_activate
+            and profit_drawdown >= self.trail_pullback
         ):
             return "trailing_take_profit"
         return None
@@ -740,8 +723,7 @@ class ShortDeclineFlipStrategy(IStrategy):
 
         # 清理缓存
         with self._api_lock:
-            self._lowest_price.pop(np, None)
-            self._highest_price.pop(np, None)
+            self._max_profit.pop(np, None)
             self._high_24h_cache.pop(np, None)
             self._low_24h_cache.pop(np, None)
             self._range_24h_cache.pop(np, None)
