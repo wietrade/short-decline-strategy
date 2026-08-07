@@ -9,8 +9,8 @@ EMA 交叉策略（EMA9 / EMA21）
   入场: EMA9 < EMA21 且 ADX > 25
   平仓: EMA9 > EMA21
 
-止损: -50%（10x杠杆下 = 价格反向5%触发）
-止盈: 移动止盈（4%激活 / 2%回撤）
+止损: -20%（10x杠杆下 = 价格反向2%触发）
+止盈: 移动止盈（20%激活 / 10%回撤）
 """
 
 import logging
@@ -66,8 +66,8 @@ class EmaCrossStrategy(IStrategy):
     adx_threshold = 25  # ADX > 25 才允许入场
 
     # ── 移动止盈参数 ──
-    trail_activate = 0.04  # 盈利偏离均价 4% 激活
-    trail_pullback = 0.02  # 从极值点回撤 2% 平仓
+    trail_activate = 0.20  # 盈利偏离均价 20% 激活
+    trail_pullback = 0.10  # 从极值点回撤 10% 平仓
 
     # ── 持仓极值追踪 ──
     _lowest_price: dict[str, float] = {}  # 空头期间最低价
